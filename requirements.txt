@@ -1,0 +1,10 @@
+stem>=1.8.2
+requests>=2.31.0
+PySocks>=1.7.1
+rich>=13.7.0
+click>=8.1.7
+geoip2>=4.8.0
+aiohttp[speedups]>=3.9.0
+aiohttp-socks>=0.8.4
+colorama>=0.4.6
+pycountry>=22.3.5

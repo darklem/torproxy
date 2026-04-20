@@ -1,0 +1,21 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+stem = ">=1.8.2"
+requests = ">=2.31.0"
+pysocks = ">=1.7.1"
+rich = ">=13.7.0"
+click = ">=8.1.7"
+geoip2 = ">=4.8.0"
+aiohttp = {version = ">=3.9.0", extras = ["speedups"]}
+aiohttp-socks = ">=0.8.4"
+colorama = ">=0.4.6"
+pycountry = ">=22.3.5"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
