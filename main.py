@@ -51,6 +51,7 @@ from proxy_cache import (
     clear_pid,
     CACHE_TTL,
 )
+from mitm_check import run_mitm_checks, display_mitm_results
 
 console = Console()
 
@@ -212,6 +213,7 @@ def run(
     list_countries_only: bool,
     skip_verify: bool,
     tor_port_arg: int = None,
+    skip_mitm_check: bool = False,
 ):
     console.print(BANNER)
     console.print()
@@ -384,6 +386,13 @@ def run(
         console.print("[yellow]Could not verify final IP (proxy may be slow).[/yellow]")
         console.print(f"[cyan]SOCKS5 server is active at socks5://127.0.0.1:{local_port}[/cyan]")
 
+    # ── MITM check (automatic at chain mount) ────────────────────────────────
+    if not skip_mitm_check:
+        console.print()
+        console.print("[cyan]Running MITM detection...[/cyan]")
+        results = run_mitm_checks(local_port)
+        display_mitm_results(results)
+
     # ── Interactive loop ──────────────────────────────────────────────────────
     proxy_index = 0
 
@@ -393,6 +402,7 @@ def run(
         "  [cyan][r][/cyan] → Rotate exit proxy\n"
         "  [cyan][n][/cyan] → New Tor circuit\n"
         "  [cyan][i][/cyan] → Check current IP\n"
+        "  [cyan][m][/cyan] → Re-run MITM detection\n"
         "  [cyan][d][/cyan] → Detach (exit UI, keep server running)\n"
         "  [cyan][q][/cyan] → Quit and stop server",
         title="⌨️  Controls",
@@ -415,7 +425,7 @@ def run(
         try:
             cmd = Prompt.ask(
                 "\n[bold cyan]>[/bold cyan]",
-                choices=["r", "n", "i", "d", "q"],
+                choices=["r", "n", "i", "m", "d", "q"],
                 show_choices=True,
             ).strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -464,6 +474,11 @@ def run(
             else:
                 console.print("[yellow]  Could not retrieve IP.[/yellow]")
 
+        elif cmd == "m":
+            console.print("[cyan]Running MITM detection...[/cyan]")
+            results = run_mitm_checks(local_port)
+            display_mitm_results(results)
+
     if detached:
         console.print("[dim]Detached session. Proxy remains active. (Ctrl+C to force stop)[/dim]")
         try:
@@ -492,9 +507,10 @@ def run(
 @click.option("--tor-port",             default=None,                type=int,        help="Use an already-running Tor SOCKS port (skip starting Tor).")
 @click.option("--verbose",        "-v", is_flag=True, default=False,                 help="Verbose output.")
 @click.option("--skip-verify",          is_flag=True, default=False,                 help="Skip proxy liveness check (faster startup).")
+@click.option("--skip-mitm-check",      is_flag=True, default=False,                 help="Skip automatic MITM detection after chain setup.")
 @click.option("--kill",           "-k", is_flag=True, default=False,                 help="Stop a detached TorProxy-Chain server.")
 @click.option("--clear-cache",          is_flag=True, default=False,                 help="Clear the proxy geolocation SQLite cache.")
-def main(country, list_countries, local_port, tor_port, verbose, skip_verify, kill, clear_cache):
+def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, kill, clear_cache):
     if kill:
         info = read_pid()
         if not info:
@@ -529,6 +545,7 @@ def main(country, list_countries, local_port, tor_port, verbose, skip_verify, ki
         list_countries_only=list_countries,
         skip_verify=skip_verify,
         tor_port_arg=tor_port,
+        skip_mitm_check=skip_mitm_check,
     )
 
 
