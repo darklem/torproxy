@@ -20,6 +20,7 @@ import sys
 import time
 import signal
 import os
+from typing import Optional
 import click
 from pathlib import Path
 
@@ -51,7 +52,10 @@ from proxy_cache import (
     clear_pid,
     CACHE_TTL,
 )
-from mitm_check import run_mitm_checks, display_mitm_results
+from mitm_check import (
+    run_mitm_checks, display_mitm_results,
+    scan_all_proxies, display_scan_results,
+)
 
 console = Console()
 
@@ -204,6 +208,39 @@ def display_chain_status(proxy: Proxy, local_port: int, ip_info: dict):
         border_style="green",
         padding=(1, 2),
     ))
+
+
+def _run_scan_mitm(tor_port_arg: Optional[int], limit: int):
+    """Standalone MITM scan: connect Tor, load cache, scan, display results."""
+    console.print(BANNER)
+    console.print()
+
+    console.print(Panel(
+        f"[bold cyan]MITM bulk scan — up to {limit} proxies from cache[/bold cyan]",
+        border_style="cyan", padding=(0, 1),
+    ))
+
+    # Connect Tor
+    tor = TorManager(external_port=tor_port_arg)
+    if not tor.start():
+        console.print("[red]Could not connect to Tor.[/red]")
+        return
+    console.print(f"[green]Tor ready at socks5://127.0.0.1:{tor.socks_port}[/green]\n")
+
+    # Load proxies from cache
+    proxies = load_cached_proxies()
+    if not proxies:
+        console.print("[yellow]Cache is empty. Run without --scan-mitm first to populate it.[/yellow]")
+        tor.stop()
+        return
+
+    proxies = proxies[:limit]
+    console.print(f"[cyan]{len(proxies)} proxies loaded from cache (limit: {limit})[/cyan]\n")
+
+    results = scan_all_proxies(proxies, tor_port=tor.socks_port)
+    display_scan_results(results)
+
+    tor.stop()
 
 
 def run(
@@ -508,9 +545,11 @@ def run(
 @click.option("--verbose",        "-v", is_flag=True, default=False,                 help="Verbose output.")
 @click.option("--skip-verify",          is_flag=True, default=False,                 help="Skip proxy liveness check (faster startup).")
 @click.option("--skip-mitm-check",      is_flag=True, default=False,                 help="Skip automatic MITM detection after chain setup.")
+@click.option("--scan-mitm",            is_flag=True, default=False,                 help="Scan all proxies in the cache for MITM and show a report.")
+@click.option("--scan-limit",           default=200,  show_default=True, type=int,   help="Max number of proxies to test during --scan-mitm.")
 @click.option("--kill",           "-k", is_flag=True, default=False,                 help="Stop a detached TorProxy-Chain server.")
 @click.option("--clear-cache",          is_flag=True, default=False,                 help="Clear the proxy geolocation SQLite cache.")
-def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, kill, clear_cache):
+def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache):
     if kill:
         info = read_pid()
         if not info:
@@ -536,6 +575,10 @@ def main(country, list_countries, local_port, tor_port, verbose, skip_verify, sk
         from proxy_cache import clear_cache as _clear_cache
         _clear_cache()
         console.print("[green]SQLite cache cleared.[/green]")
+        return
+
+    if scan_mitm:
+        _run_scan_mitm(tor_port_arg=tor_port, limit=scan_limit)
         return
 
     run(
