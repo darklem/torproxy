@@ -1,6 +1,6 @@
 """
-Scraper de proxies SOCKS publics depuis plusieurs sources.
-Récupère, déduplique et filtre les proxies par pays.
+Public SOCKS proxy scraper from multiple sources.
+Fetches, deduplicates and filters proxies by country.
 """
 
 import re
@@ -19,21 +19,19 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 console = Console()
 
-# Timeout pour vérifier un proxy
 PROXY_CHECK_TIMEOUT = 8
-# Nombre de workers pour le check concurrent
 MAX_CHECK_WORKERS = 30
 
 
 @dataclass
 class Proxy:
-    """Représente un proxy SOCKS."""
+    """Represents a SOCKS proxy."""
     host: str
     port: int
-    proto: str = "socks5"       # "socks4" ou "socks5"
-    country: str = ""           # Code pays ISO 2 lettres (ex: "FR", "US")
-    country_name: str = ""      # Nom complet du pays
-    latency_ms: float = -1.0    # -1 = non testé
+    proto: str = "socks5"       # "socks4" or "socks5"
+    country: str = ""           # ISO 2-letter country code (e.g. "FR", "US")
+    country_name: str = ""      # Full country name
+    latency_ms: float = -1.0    # -1 = not tested
     alive: bool = False
     username: str = ""
     password: str = ""
@@ -54,12 +52,10 @@ class Proxy:
         return isinstance(other, Proxy) and self.host == other.host and self.port == other.port
 
 
-# ──────────────────────────────────────────────
-# Sources de proxies publics
-# ──────────────────────────────────────────────
+# ── Proxy sources ─────────────────────────────────────────────────────────────
 
 def _fetch_proxyscrape_socks5() -> List[Proxy]:
-    """proxyscrape.com – SOCKS5."""
+    """proxyscrape.com — SOCKS5."""
     proxies = []
     urls = [
         "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_type=socks5&timeout=10000&country=all&simplified=true",
@@ -82,7 +78,7 @@ def _fetch_proxyscrape_socks5() -> List[Proxy]:
 
 
 def _fetch_proxyscrape_socks4() -> List[Proxy]:
-    """proxyscrape.com – SOCKS4."""
+    """proxyscrape.com — SOCKS4."""
     proxies = []
     urls = [
         "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_type=socks4&timeout=10000&country=all&simplified=true",
@@ -105,7 +101,7 @@ def _fetch_proxyscrape_socks4() -> List[Proxy]:
 
 
 def _fetch_github_hookzof() -> List[Proxy]:
-    """hookzof/socks5_list sur GitHub."""
+    """hookzof/socks5_list on GitHub."""
     proxies = []
     url = "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"
     try:
@@ -124,7 +120,7 @@ def _fetch_github_hookzof() -> List[Proxy]:
 
 
 def _fetch_github_proxifly() -> List[Proxy]:
-    """proxifly/proxy-list – SOCKS5 avec pays."""
+    """proxifly/proxy-list — SOCKS5 with country."""
     proxies = []
     url = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"
     try:
@@ -143,7 +139,7 @@ def _fetch_github_proxifly() -> List[Proxy]:
 
 
 def _fetch_github_thespeedx() -> List[Proxy]:
-    """TheSpeedX/PROXY-List – SOCKS5."""
+    """TheSpeedX/PROXY-List — SOCKS5."""
     proxies = []
     url = "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"
     try:
@@ -162,7 +158,7 @@ def _fetch_github_thespeedx() -> List[Proxy]:
 
 
 def _fetch_github_thespeedx_s4() -> List[Proxy]:
-    """TheSpeedX/PROXY-List – SOCKS4."""
+    """TheSpeedX/PROXY-List — SOCKS4."""
     proxies = []
     url = "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt"
     try:
@@ -181,7 +177,7 @@ def _fetch_github_thespeedx_s4() -> List[Proxy]:
 
 
 def _fetch_github_monosans() -> List[Proxy]:
-    """monosans/proxy-list – SOCKS5."""
+    """monosans/proxy-list — SOCKS5."""
     proxies = []
     urls = [
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
@@ -191,7 +187,7 @@ def _fetch_github_monosans() -> List[Proxy]:
         try:
             r = requests.get(url, timeout=15)
             for line in r.text.strip().splitlines():
-                line = line.strip().split()[0]  # enlever commentaires éventuels
+                line = line.strip().split()[0]  # strip trailing comments
                 if ":" in line:
                     host, port_s = line.rsplit(":", 1)
                     try:
@@ -204,12 +200,12 @@ def _fetch_github_monosans() -> List[Proxy]:
 
 
 def _fetch_proxylist_download() -> List[Proxy]:
-    """proxy-list.download – SOCKS5 avec pays."""
+    """proxy-list.download — SOCKS5 with country."""
     proxies = []
     try:
         r = requests.get(
             "https://www.proxy-list.download/api/v2/get?l=en&t=socks5",
-            timeout=15
+            timeout=15,
         )
         data = r.json()
         for item in data.get("LISTA", []):
@@ -222,7 +218,7 @@ def _fetch_proxylist_download() -> List[Proxy]:
                         host=host,
                         port=int(port_s),
                         proto="socks5",
-                        country=country.upper()[:2] if country else ""
+                        country=country.upper()[:2] if country else "",
                     ))
                 except ValueError:
                     pass
@@ -232,13 +228,10 @@ def _fetch_proxylist_download() -> List[Proxy]:
 
 
 def _fetch_openproxylist() -> List[Proxy]:
-    """openproxylist.xyz – SOCKS5."""
+    """openproxylist.xyz — SOCKS5."""
     proxies = []
     try:
-        r = requests.get(
-            "https://openproxylist.xyz/socks5.txt",
-            timeout=15
-        )
+        r = requests.get("https://openproxylist.xyz/socks5.txt", timeout=15)
         for line in r.text.strip().splitlines():
             line = line.strip()
             if ":" in line:
@@ -252,14 +245,12 @@ def _fetch_openproxylist() -> List[Proxy]:
     return proxies
 
 
-# ──────────────────────────────────────────────
-# Résolution de pays via IP-API
-# ──────────────────────────────────────────────
+# ── Country resolution via ip-api.com ─────────────────────────────────────────
 
 def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = None) -> List[Proxy]:
     """
-    Enrichit les proxies sans info pays en interrogeant ip-api.com
-    (batch de 100 max par requête).
+    Enrich proxies that have no country by querying ip-api.com in batches of 100.
+    Requests are routed through Tor if via_tor_port is set.
     """
     to_resolve = [p for p in proxies if not p.country]
     if not to_resolve:
@@ -268,7 +259,7 @@ def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = 
     req_kwargs = {}
     if via_tor_port:
         req_kwargs["proxies"] = {
-            "http": f"socks5h://127.0.0.1:{via_tor_port}",
+            "http":  f"socks5h://127.0.0.1:{via_tor_port}",
             "https": f"socks5h://127.0.0.1:{via_tor_port}",
         }
 
@@ -283,12 +274,12 @@ def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = 
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
-            TextColumn("[dim]{task.fields[resolved]} résolus[/dim]"),
+            TextColumn("[dim]{task.fields[resolved]} resolved[/dim]"),
             console=console,
             transient=False,
         ) as progress:
             task = progress.add_task(
-                f"[cyan]🌍 Géolocalisation via ip-api.com...[/cyan]",
+                "[cyan]Geolocating via ip-api.com...[/cyan]",
                 total=total_batches,
                 resolved=0,
             )
@@ -300,7 +291,7 @@ def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = 
                         "http://ip-api.com/batch?fields=query,countryCode,country",
                         json=payload,
                         timeout=20,
-                        **req_kwargs
+                        **req_kwargs,
                     )
                     for entry in r.json():
                         query = entry.get("query", "")
@@ -311,19 +302,18 @@ def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = 
                 except Exception:
                     pass
 
-                resolved_so_far = len(ip_map)
                 progress.update(
                     task,
                     advance=1,
-                    resolved=resolved_so_far,
+                    resolved=len(ip_map),
                     description=(
-                        f"[cyan]🌍 Géolocalisation "
+                        f"[cyan]Geolocation "
                         f"[bold]{batch_idx + 1}/{total_batches}[/bold] batches...[/cyan]"
                     ),
                 )
 
                 if batch_idx < total_batches - 1:
-                    time.sleep(0.5)  # rate-limit ip-api (45 req/min)
+                    time.sleep(0.5)  # ip-api rate limit: 45 req/min
 
     except Exception:
         pass
@@ -335,28 +325,16 @@ def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = 
     return proxies
 
 
-# ──────────────────────────────────────────────
-# Vérification des proxies
-# ──────────────────────────────────────────────
+# ── Proxy liveness check ──────────────────────────────────────────────────────
 
 def _check_proxy(proxy: Proxy, via_tor_port: Optional[int] = None) -> Proxy:
     """
-    Teste si un proxy est vivant en s'y connectant via Tor (si dispo)
-    puis en vérifiant une connexion TCP basique.
+    Test whether a proxy is reachable.
+    If via_tor_port is set, the TCP connection goes through Tor first.
     """
     start = time.monotonic()
     try:
         if via_tor_port:
-            # Teste le proxy en passant par Tor : Tor → proxy → ipify
-            import requests as req_mod
-            session = req_mod.Session()
-            session.proxies = {
-                "http": f"socks5h://127.0.0.1:{via_tor_port}",
-                "https": f"socks5h://127.0.0.1:{via_tor_port}",
-            }
-            # On tente de se connecter AU proxy via Tor (TCP check)
-            # puis de faire une requête HTTP depuis le proxy
-            # Pour simplifier, on teste juste la connectivité TCP vers le proxy via Tor
             import socks as socks_mod
             s = socks_mod.socksocket()
             s.set_proxy(socks_mod.SOCKS5, "127.0.0.1", via_tor_port)
@@ -364,7 +342,6 @@ def _check_proxy(proxy: Proxy, via_tor_port: Optional[int] = None) -> Proxy:
             s.connect((proxy.host, proxy.port))
             s.close()
         else:
-            # TCP connect direct
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(PROXY_CHECK_TIMEOUT)
             s.connect((proxy.host, proxy.port))
@@ -384,7 +361,7 @@ def check_proxies(
     max_workers: int = MAX_CHECK_WORKERS,
     show_progress: bool = True,
 ) -> List[Proxy]:
-    """Vérifie tous les proxies en parallèle et retourne ceux qui sont vivants."""
+    """Check all proxies in parallel and return the alive ones sorted by latency."""
     results = []
 
     if show_progress:
@@ -396,8 +373,8 @@ def check_proxies(
             console=console,
         ) as progress:
             task = progress.add_task(
-                f"[cyan]Vérification de {len(proxies)} proxies...[/cyan]",
-                total=len(proxies)
+                f"[cyan]Checking {len(proxies)} proxies...[/cyan]",
+                total=len(proxies),
             )
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
@@ -405,8 +382,7 @@ def check_proxies(
                     for p in proxies
                 }
                 for future in concurrent.futures.as_completed(futures):
-                    proxy = future.result()
-                    results.append(proxy)
+                    results.append(future.result())
                     progress.advance(task)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -416,25 +392,23 @@ def check_proxies(
     return sorted(alive, key=lambda p: p.latency_ms)
 
 
-# ──────────────────────────────────────────────
-# Point d'entrée principal
-# ──────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 SCRAPERS = [
-    ("proxyscrape SOCKS5",    _fetch_proxyscrape_socks5),
-    ("proxyscrape SOCKS4",    _fetch_proxyscrape_socks4),
-    ("GitHub hookzof",        _fetch_github_hookzof),
-    ("GitHub proxifly",       _fetch_github_proxifly),
-    ("GitHub TheSpeedX S5",   _fetch_github_thespeedx),
-    ("GitHub TheSpeedX S4",   _fetch_github_thespeedx_s4),
-    ("GitHub monosans",       _fetch_github_monosans),
-    ("proxy-list.download",   _fetch_proxylist_download),
-    ("openproxylist.xyz",     _fetch_openproxylist),
+    ("proxyscrape SOCKS5",   _fetch_proxyscrape_socks5),
+    ("proxyscrape SOCKS4",   _fetch_proxyscrape_socks4),
+    ("GitHub hookzof",       _fetch_github_hookzof),
+    ("GitHub proxifly",      _fetch_github_proxifly),
+    ("GitHub TheSpeedX S5",  _fetch_github_thespeedx),
+    ("GitHub TheSpeedX S4",  _fetch_github_thespeedx_s4),
+    ("GitHub monosans",      _fetch_github_monosans),
+    ("proxy-list.download",  _fetch_proxylist_download),
+    ("openproxylist.xyz",    _fetch_openproxylist),
 ]
 
 
 def fetch_all_proxies(verbose: bool = False) -> List[Proxy]:
-    """Récupère les proxies depuis toutes les sources, déduplique."""
+    """Fetch proxies from all sources and deduplicate."""
     all_proxies: List[Proxy] = []
     seen = set()
 
@@ -443,7 +417,10 @@ def fetch_all_proxies(verbose: bool = False) -> List[Proxy]:
         TextColumn("[progress.description]{task.description}"),
         console=console,
     ) as progress:
-        task = progress.add_task("[cyan]Récupération des proxies publics...[/cyan]", total=len(SCRAPERS))
+        task = progress.add_task(
+            "[cyan]Fetching public proxies...[/cyan]",
+            total=len(SCRAPERS),
+        )
 
         for name, scraper in SCRAPERS:
             progress.update(task, description=f"[cyan]Scraping: {name}[/cyan]")
@@ -460,18 +437,17 @@ def fetch_all_proxies(verbose: bool = False) -> List[Proxy]:
                     console.print(f"  [dim]{name}: {new} proxies[/dim]")
             except Exception as e:
                 if verbose:
-                    console.print(f"  [red]{name}: erreur – {e}[/red]")
+                    console.print(f"  [red]{name}: error — {e}[/red]")
             progress.advance(task)
 
-    console.print(f"[green]✓ {len(all_proxies)} proxies uniques collectés depuis {len(SCRAPERS)} sources[/green]")
+    console.print(
+        f"[green]{len(all_proxies)} unique proxies collected from {len(SCRAPERS)} sources.[/green]"
+    )
     return all_proxies
 
 
 def get_countries_available(proxies: List[Proxy]) -> Dict[str, int]:
-    """
-    Retourne un dict { code_pays: nombre_proxies }
-    pour les proxies ayant une info pays.
-    """
+    """Return a {country_code: proxy_count} dict for proxies that have country info."""
     countries: Dict[str, int] = {}
     for p in proxies:
         if p.country:
@@ -480,6 +456,6 @@ def get_countries_available(proxies: List[Proxy]) -> Dict[str, int]:
 
 
 def filter_by_country(proxies: List[Proxy], country_code: str) -> List[Proxy]:
-    """Filtre les proxies par code pays ISO."""
+    """Filter proxies by ISO country code."""
     cc = country_code.upper().strip()
     return [p for p in proxies if p.country.upper() == cc]

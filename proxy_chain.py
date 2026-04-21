@@ -1,11 +1,11 @@
 """
-Moteur de chainage de proxies.
+Proxy chaining engine.
 
-Architecture du chainage :
-    Client → [Serveur SOCKS local] → Tor (9050) → Proxy SOCKS public → Internet
+Chain architecture:
+    Client → [Local SOCKS server] → Tor → Public SOCKS proxy → Internet
 
-Le serveur SOCKS local créé par ce module agit comme un point d'entrée unique.
-Toute connexion entrante est relayée via Tor, puis via le proxy SOCKS choisi.
+The local SOCKS5 server created by this module acts as the single entry point.
+Every incoming connection is relayed through Tor, then through the chosen exit proxy.
 """
 
 import socket
@@ -24,13 +24,14 @@ from proxy_scraper import Proxy
 console = Console()
 logger = logging.getLogger(__name__)
 
+DEFAULT_LOCAL_PORT = 10800
+LOCAL_BIND = "0.0.0.0"   # listen on all interfaces so LAN devices can use the proxy
 
-# ──────────────────────────────────────────────
-# Lecture fiable (recv exact N octets)
-# ──────────────────────────────────────────────
+
+# ── Reliable recv ─────────────────────────────────────────────────────────────
 
 def _recvall(sock: socket.socket, n: int) -> bytes:
-    """Lit exactement n octets depuis le socket (robuste à la fragmentation TCP)."""
+    """Read exactly n bytes from a socket (handles TCP fragmentation)."""
     data = b""
     while len(data) < n:
         chunk = sock.recv(n - len(data))
@@ -39,41 +40,31 @@ def _recvall(sock: socket.socket, n: int) -> bytes:
         data += chunk
     return data
 
-# Port du serveur SOCKS local qu'on crée
-DEFAULT_LOCAL_PORT = 10800
-# Adresse de liaison du serveur local (0.0.0.0 = accessible réseau)
-LOCAL_BIND = "0.0.0.0"
 
-
-# ──────────────────────────────────────────────
-# Utilitaires SOCKS5 handshake
-# ──────────────────────────────────────────────
+# ── SOCKS5 server-side handshake ──────────────────────────────────────────────
 
 def _socks5_handshake(client_sock: socket.socket) -> Optional[Tuple[str, int]]:
     """
-    Gère le handshake SOCKS5 côté serveur et retourne (host, port) demandé.
-    Retourne None en cas d'erreur.
+    Handle the server-side SOCKS5 handshake.
+    Returns (host, port) requested by the client, or None on error.
     """
     try:
-        # Phase 1 : négociation méthode
         header = _recvall(client_sock, 2)
         if header[0] != 0x05:
             return None
         nmethods = header[1]
-        _recvall(client_sock, nmethods)   # lire et ignorer les méthodes
-        # On accepte sans authentification (méthode 0x00)
-        client_sock.sendall(b"\x05\x00")
+        _recvall(client_sock, nmethods)       # consume method list
+        client_sock.sendall(b"\x05\x00")      # accept: no authentication
 
-        # Phase 2 : requête de connexion (4 octets fixes)
         req = _recvall(client_sock, 4)
         if req[0] != 0x05 or req[1] != 0x01:
             client_sock.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)
             return None
 
         atype = req[3]
-        if atype == 0x01:  # IPv4
+        if atype == 0x01:    # IPv4
             host = socket.inet_ntoa(_recvall(client_sock, 4))
-        elif atype == 0x03:  # Domain name
+        elif atype == 0x03:  # domain name
             length = _recvall(client_sock, 1)[0]
             host = _recvall(client_sock, length).decode()
         elif atype == 0x04:  # IPv6
@@ -89,7 +80,6 @@ def _socks5_handshake(client_sock: socket.socket) -> Optional[Tuple[str, int]]:
 
 
 def _socks5_reply_success(client_sock: socket.socket, bound_host: str = "0.0.0.0", bound_port: int = 0):
-    """Envoie une réponse SOCKS5 de succès au client."""
     try:
         addr_bytes = socket.inet_aton(bound_host)
         port_bytes = struct.pack("!H", bound_port)
@@ -99,34 +89,28 @@ def _socks5_reply_success(client_sock: socket.socket, bound_host: str = "0.0.0.0
 
 
 def _socks5_reply_error(client_sock: socket.socket, code: int = 0x04):
-    """Envoie une réponse SOCKS5 d'erreur au client."""
     try:
         client_sock.sendall(bytes([0x05, code, 0x00, 0x01]) + b"\x00" * 6)
     except Exception:
         pass
 
 
-# ──────────────────────────────────────────────
-# Relay de données bidirectionnel
-# ──────────────────────────────────────────────
+# ── Bidirectional relay ───────────────────────────────────────────────────────
 
 def _relay(sock_a: socket.socket, sock_b: socket.socket, timeout: int = 60):
-    """Relaie les données entre deux sockets dans les deux sens."""
+    """Relay data between two sockets in both directions."""
     sock_a.settimeout(timeout)
     sock_b.settimeout(timeout)
     try:
         while True:
             try:
-                readable, _, exceptional = select.select([sock_a, sock_b], [], [sock_a, sock_b], timeout)
+                readable, _, exceptional = select.select(
+                    [sock_a, sock_b], [], [sock_a, sock_b], timeout
+                )
             except Exception:
                 break
-
-            if exceptional:
+            if exceptional or not readable:
                 break
-
-            if not readable:
-                break
-
             for s in readable:
                 other = sock_b if s is sock_a else sock_a
                 try:
@@ -140,19 +124,12 @@ def _relay(sock_a: socket.socket, sock_b: socket.socket, timeout: int = 60):
         pass
 
 
-# ──────────────────────────────────────────────
-# Gestionnaire de client (thread)
-# ──────────────────────────────────────────────
+# ── Per-connection handler (thread) ──────────────────────────────────────────
 
 class _ClientHandler(threading.Thread):
-    """Thread gérant une connexion client vers le proxy chaîné."""
+    """Thread that handles a single client connection through the proxy chain."""
 
-    def __init__(
-        self,
-        client_sock: socket.socket,
-        tor_port: int,
-        exit_proxy: Proxy,
-    ):
+    def __init__(self, client_sock: socket.socket, tor_port: int, exit_proxy: Proxy):
         super().__init__(daemon=True)
         self.client_sock = client_sock
         self.tor_port = tor_port
@@ -161,22 +138,17 @@ class _ClientHandler(threading.Thread):
     def run(self):
         remote_sock = None
         try:
-            # 1. Handshake SOCKS5 avec le client local
             result = _socks5_handshake(self.client_sock)
             if not result:
                 return
             target_host, target_port = result
 
-            # 2. Connexion via Tor → proxy exit (double hop)
             remote_sock = self._connect_chain(target_host, target_port)
             if remote_sock is None:
                 _socks5_reply_error(self.client_sock, 0x04)
                 return
 
-            # 3. Répondre succès au client local
             _socks5_reply_success(self.client_sock)
-
-            # 4. Relayer les données
             _relay(self.client_sock, remote_sock)
 
         except Exception as e:
@@ -191,29 +163,19 @@ class _ClientHandler(threading.Thread):
 
     def _connect_chain(self, target_host: str, target_port: int) -> Optional[socket.socket]:
         """
-        Établit la chaîne : Tor SOCKS5 (port 9050) → proxy exit → target.
+        Build the chain: local → Tor (SOCKS5) → exit proxy (SOCKS4/5) → target.
 
-        On crée un socket PySocks qui se connecte D'ABORD à Tor,
-        puis Tor se connecte au proxy exit, puis le proxy exit
-        se connecte à la destination.
-
-        En pratique on fait :
-          PySocks → Tor → proxy exit (on parle SOCKS4/5 avec lui)
-          puis le proxy exit → destination
+        Step A: open a PySocks socket that tunnels through Tor to reach the exit proxy.
+        Step B: speak SOCKS4/5 with the exit proxy to reach the final destination.
         """
         try:
-            # Étape A : connexion à Tor, puis via Tor vers le proxy exit
             tor_sock = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
             tor_sock.set_proxy(socks.SOCKS5, "127.0.0.1", self.tor_port, rdns=True)
             tor_sock.settimeout(20)
-            # On se connecte AU proxy exit via Tor
             tor_sock.connect((self.exit_proxy.host, self.exit_proxy.port))
 
-            # Étape B : faire le handshake SOCKS avec le proxy exit
             proto = self.exit_proxy.proto.lower()
-            if proto == "socks5":
-                self._socks5_connect(tor_sock, target_host, target_port)
-            elif proto == "socks4":
+            if proto == "socks4":
                 self._socks4_connect(tor_sock, target_host, target_port)
             else:
                 self._socks5_connect(tor_sock, target_host, target_port)
@@ -225,64 +187,58 @@ class _ClientHandler(threading.Thread):
             return None
 
     def _socks5_connect(self, sock: socket.socket, host: str, port: int):
-        """Handshake SOCKS5 CLIENT vers le proxy exit."""
-        # Négociation méthode (sans auth)
+        """Client-side SOCKS5 handshake toward the exit proxy."""
         sock.sendall(b"\x05\x01\x00")
         resp = _recvall(sock, 2)
         if resp[0] != 0x05 or resp[1] != 0x00:
-            raise ConnectionError(f"SOCKS5 auth failed: {resp!r}")
+            raise ConnectionError(f"SOCKS5 auth rejected: {resp!r}")
 
-        # Requête CONNECT avec le nom de domaine (ATYP 0x03)
+        # Always send as domain name (ATYP 0x03) — no local DNS resolution
         host_bytes = host.encode()
-        request = (
+        sock.sendall(
             b"\x05\x01\x00\x03"
             + bytes([len(host_bytes)])
             + host_bytes
             + struct.pack("!H", port)
         )
-        sock.sendall(request)
 
-        # Lire la réponse : 4 octets fixes (VER, REP, RSV, ATYP)
-        header = _recvall(sock, 4)
+        header = _recvall(sock, 4)   # VER, REP, RSV, ATYP
         if header[1] != 0x00:
             raise ConnectionError(f"SOCKS5 CONNECT failed: code=0x{header[1]:02x}")
 
-        # Consommer l'adresse de liaison (BND.ADDR + BND.PORT) selon ATYP
+        # Consume BND.ADDR + BND.PORT (variable length depending on ATYP)
         atyp = header[3]
-        if atyp == 0x01:        # IPv4 : 4 octets
+        if atyp == 0x01:
             _recvall(sock, 4 + 2)
-        elif atyp == 0x03:      # Domain name : 1 octet longueur + N octets + 2 port
+        elif atyp == 0x03:
             domain_len = _recvall(sock, 1)[0]
             _recvall(sock, domain_len + 2)
-        elif atyp == 0x04:      # IPv6 : 16 octets
+        elif atyp == 0x04:
             _recvall(sock, 16 + 2)
         else:
-            raise ConnectionError(f"SOCKS5 CONNECT: ATYP inconnu 0x{atyp:02x}")
+            raise ConnectionError(f"SOCKS5 CONNECT: unknown ATYP 0x{atyp:02x}")
 
     def _socks4_connect(self, sock: socket.socket, host: str, port: int):
-        """Handshake SOCKS4a CLIENT vers le proxy exit."""
+        """Client-side SOCKS4a handshake toward the exit proxy."""
         host_bytes = host.encode() + b"\x00"
-        request = (
+        sock.sendall(
             b"\x04\x01"
             + struct.pack("!H", port)
-            + b"\x00\x00\x00\x01"  # IP 0.0.0.1 = SOCKS4a
-            + b"\x00"              # user ID vide
+            + b"\x00\x00\x00\x01"   # IP 0.0.0.1 signals SOCKS4a
+            + b"\x00"               # empty user ID
             + host_bytes
         )
-        sock.sendall(request)
         resp = _recvall(sock, 8)
         if resp[1] != 0x5A:
             raise ConnectionError(f"SOCKS4 CONNECT failed: code=0x{resp[1]:02x}")
 
 
-# ──────────────────────────────────────────────
-# Serveur SOCKS5 local
-# ──────────────────────────────────────────────
+# ── Local SOCKS5 server ───────────────────────────────────────────────────────
 
 class ProxyChainServer:
     """
-    Serveur SOCKS5 local qui chaîne les connexions :
-    Client → Serveur (local) → Tor → Proxy exit SOCKS → Internet
+    Local SOCKS5 server that chains connections:
+        Client → Server (local) → Tor → Exit SOCKS proxy → Internet
     """
 
     def __init__(
@@ -301,7 +257,7 @@ class ProxyChainServer:
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> bool:
-        """Démarre le serveur SOCKS5 local dans un thread séparé."""
+        """Start the local SOCKS5 server in a background thread."""
         try:
             self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -311,26 +267,24 @@ class ProxyChainServer:
             self._thread = threading.Thread(target=self._accept_loop, daemon=True)
             self._thread.start()
             console.print(
-                f"[green]✓ Serveur SOCKS5 local démarré sur "
+                f"[green]Local SOCKS5 server ready: "
                 f"[bold]socks5://{self.local_host}:{self.local_port}[/bold][/green]"
             )
             return True
         except Exception as e:
-            console.print(f"[red]❌ Impossible de démarrer le serveur local: {e}[/red]")
+            console.print(f"[red]Failed to start local server: {e}[/red]")
             return False
 
     def _accept_loop(self):
-        """Boucle principale d'acceptation des connexions."""
         self._server_sock.settimeout(1.0)
         while self._running:
             try:
-                client_sock, addr = self._server_sock.accept()
-                handler = _ClientHandler(
+                client_sock, _ = self._server_sock.accept()
+                _ClientHandler(
                     client_sock=client_sock,
                     tor_port=self.tor_port,
                     exit_proxy=self.exit_proxy,
-                )
-                handler.start()
+                ).start()
             except socket.timeout:
                 continue
             except Exception as e:
@@ -339,15 +293,14 @@ class ProxyChainServer:
                 break
 
     def swap_exit_proxy(self, new_proxy: Proxy):
-        """Remplace le proxy de sortie à chaud (sans redémarrer)."""
+        """Hot-swap the exit proxy without restarting the server."""
         self.exit_proxy = new_proxy
         console.print(
-            f"[cyan]🔄 Proxy de sortie changé → [bold]{new_proxy.address}[/bold] "
+            f"[cyan]Exit proxy swapped → [bold]{new_proxy.address}[/bold] "
             f"({new_proxy.country or '??'})[/cyan]"
         )
 
     def stop(self):
-        """Arrête le serveur proprement."""
         self._running = False
         if self._server_sock:
             try:
@@ -365,25 +318,23 @@ class ProxyChainServer:
         self.stop()
 
 
-# ──────────────────────────────────────────────
-# Vérification de l'IP finale via la chaîne
-# ──────────────────────────────────────────────
+# ── Final IP check ────────────────────────────────────────────────────────────
 
 def get_chained_ip(local_port: int = DEFAULT_LOCAL_PORT) -> Optional[dict]:
     """
-    Récupère l'IP publique en passant par le serveur SOCKS local (= chaîne complète).
-    Retourne un dict avec ip, country, city, org.
+    Fetch the public IP through the local SOCKS server (full chain).
+    Returns a dict with ip, country, city, org.
     """
     import requests as req
 
     proxies = {
-        "http": f"socks5h://127.0.0.1:{local_port}",
+        "http":  f"socks5h://127.0.0.1:{local_port}",
         "https": f"socks5h://127.0.0.1:{local_port}",
     }
     endpoints = [
-        ("https://ipinfo.io/json", "json"),
-        ("http://ip-api.com/json", "json"),
-        ("https://api.ipify.org", "text"),
+        ("https://ipinfo.io/json",  "json"),
+        ("http://ip-api.com/json",  "json"),
+        ("https://api.ipify.org",   "text"),
     ]
     for url, fmt in endpoints:
         try:
@@ -391,10 +342,10 @@ def get_chained_ip(local_port: int = DEFAULT_LOCAL_PORT) -> Optional[dict]:
             if fmt == "json":
                 data = r.json()
                 return {
-                    "ip": data.get("ip") or data.get("query", "?"),
+                    "ip":      data.get("ip") or data.get("query", "?"),
                     "country": data.get("country") or data.get("countryCode", "?"),
-                    "city": data.get("city", "?"),
-                    "org": data.get("org") or data.get("isp", "?"),
+                    "city":    data.get("city", "?"),
+                    "org":     data.get("org") or data.get("isp", "?"),
                 }
             else:
                 return {"ip": r.text.strip(), "country": "?", "city": "?", "org": "?"}

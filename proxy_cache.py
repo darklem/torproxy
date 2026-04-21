@@ -1,6 +1,6 @@
 """
-Cache SQLite pour les proxies géolocalisés.
-Évite de ré-interroger ip-api.com à chaque lancement.
+SQLite cache for geolocated proxies.
+Avoids re-querying ip-api.com on every run.
 """
 
 import sqlite3
@@ -11,19 +11,11 @@ from typing import List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from proxy_scraper import Proxy
 
-# ──────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────
-
 CACHE_DIR  = Path.home() / ".torproxy-chain"
 CACHE_FILE = CACHE_DIR / "proxy_cache.db"
-CACHE_TTL  = 24 * 3600   # 24 heures en secondes
+CACHE_TTL  = 24 * 3600   # 24 hours in seconds
 PID_FILE   = CACHE_DIR / "torproxy.pid"
 
-
-# ──────────────────────────────────────────────
-# Connexion / init schema
-# ──────────────────────────────────────────────
 
 def _get_conn() -> sqlite3.Connection:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,13 +35,9 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-# ──────────────────────────────────────────────
-# API publique
-# ──────────────────────────────────────────────
-
 def load_cached_proxies(ttl: int = CACHE_TTL) -> List["Proxy"]:
-    """Charge les proxies non expirés depuis le cache."""
-    from proxy_scraper import Proxy  # import tardif pour éviter le circulaire
+    """Load non-expired proxies from the cache."""
+    from proxy_scraper import Proxy
     try:
         conn = _get_conn()
         cutoff = time.time() - ttl
@@ -70,7 +58,7 @@ def load_cached_proxies(ttl: int = CACHE_TTL) -> List["Proxy"]:
 
 
 def save_proxies_to_cache(proxies: List["Proxy"]) -> None:
-    """Insère ou remplace les proxies dans le cache (upsert)."""
+    """Upsert proxies into the cache."""
     try:
         conn = _get_conn()
         now = time.time()
@@ -78,10 +66,7 @@ def save_proxies_to_cache(proxies: List["Proxy"]) -> None:
             """INSERT OR REPLACE INTO proxies
                (host, port, proto, country, country_name, cached_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            [
-                (p.host, p.port, p.proto, p.country, p.country_name, now)
-                for p in proxies
-            ],
+            [(p.host, p.port, p.proto, p.country, p.country_name, now) for p in proxies],
         )
         conn.commit()
         conn.close()
@@ -90,7 +75,7 @@ def save_proxies_to_cache(proxies: List["Proxy"]) -> None:
 
 
 def count_cached_proxies(ttl: int = CACHE_TTL) -> int:
-    """Nombre de proxies valides en cache."""
+    """Return the number of valid (non-expired) entries in the cache."""
     try:
         conn = _get_conn()
         cutoff = time.time() - ttl
@@ -105,8 +90,8 @@ def count_cached_proxies(ttl: int = CACHE_TTL) -> int:
 
 def cache_age_hours(ttl: int = CACHE_TTL) -> Optional[float]:
     """
-    Retourne l'âge (en heures) de l'entrée la plus récente du cache,
-    ou None si le cache est vide / expiré.
+    Return the age in hours of the most recent cache entry,
+    or None if the cache is empty or fully expired.
     """
     try:
         conn = _get_conn()
@@ -121,7 +106,7 @@ def cache_age_hours(ttl: int = CACHE_TTL) -> Optional[float]:
 
 
 def clear_cache() -> None:
-    """Vide entièrement le cache."""
+    """Delete all entries from the cache."""
     try:
         conn = _get_conn()
         conn.execute("DELETE FROM proxies")
@@ -131,36 +116,33 @@ def clear_cache() -> None:
         pass
 
 
-# ──────────────────────────────────────────────
-# Gestion du PID (serveur en arrière-plan)
-# ──────────────────────────────────────────────
+# ── PID file (background server) ──────────────────────────────────────────────
 
 def write_pid(pid: int, local_port: int, country: str) -> None:
-    """Enregistre le PID et les infos du serveur actif."""
+    """Write the PID and server metadata to the PID file."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(f"{pid}\n{local_port}\n{country}\n")
 
 
 def read_pid() -> Optional[dict]:
     """
-    Lit le fichier PID.
-    Retourne None si le processus n'est plus actif.
+    Read the PID file and verify the process is still alive.
+    Returns None if the process is gone or the file does not exist.
     """
     try:
         lines = PID_FILE.read_text().strip().splitlines()
         pid        = int(lines[0])
-        local_port = int(lines[1]) if len(lines) > 1 else 1080
+        local_port = int(lines[1]) if len(lines) > 1 else 10800
         country    = lines[2].strip() if len(lines) > 2 else "?"
-        # vérifie que le processus existe encore
         import os
-        os.kill(pid, 0)   # signal 0 = juste vérifier
+        os.kill(pid, 0)   # signal 0 = existence check only
         return {"pid": pid, "local_port": local_port, "country": country}
     except Exception:
         return None
 
 
 def clear_pid() -> None:
-    """Supprime le fichier PID."""
+    """Remove the PID file."""
     try:
         PID_FILE.unlink(missing_ok=True)
     except Exception:

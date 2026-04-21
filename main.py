@@ -2,16 +2,17 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║              🧅  TorProxy-Chain  ⛓️                              ║
-║   Tor + Chainage de proxies SOCKS publics par pays               ║
+║   Tor + public SOCKS proxy chaining with country selection       ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-Architecture :
-  Vous ──► Tor (9050) ──► Proxy SOCKS public [pays choisi] ──► Internet
+Architecture:
+  You ──► Tor (9050) ──► Public SOCKS proxy [chosen country] ──► Internet
 
-Usage :
-  python main.py                      # Mode interactif
-  python main.py --country FR         # Pays direct
-  python main.py --list-countries     # Lister les pays disponibles
+Usage:
+  python main.py                      # interactive mode
+  python main.py --country FR         # direct country selection
+  python main.py --list-countries     # list available countries
+  python main.py --tor-port 9150      # use an existing Tor SOCKS port
   python main.py --country US --local-port 1080
 """
 
@@ -53,22 +54,17 @@ from proxy_cache import (
 
 console = Console()
 
-# ──────────────────────────────────────────────
-# Bannière
-# ──────────────────────────────────────────────
-
 BANNER = """[bold cyan]
   ████████╗ ██████╗ ██████╗    ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
      ██╔══╝██╔═══██╗██╔══██╗  ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
-     ██║   ██║   ██║██████╔╝  ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ 
-     ██║   ██║   ██║██╔══██╗  ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  
-     ██║   ╚██████╔╝██║  ██║  ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   
-     ╚═╝    ╚═════╝ ╚═╝  ╚═╝  ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝  
+     ██║   ██║   ██║██████╔╝  ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝
+     ██║   ██║   ██║██╔══██╗  ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝
+     ██║   ╚██████╔╝██║  ██║  ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║
+     ╚═╝    ╚═════╝ ╚═╝  ╚═╝  ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝
 [/bold cyan]
-[dim]         ⛓️  CHAIN  |  🧅 TOR  |  🌍 SOCKS PROXY PAR PAYS  ⛓️[/dim]"""
+[dim]         ⛓️  CHAIN  |  🧅 TOR  |  🌍 SOCKS PROXY BY COUNTRY  ⛓️[/dim]"""
 
 
-# Drapeaux emoji par code pays (quelques-uns)
 COUNTRY_FLAGS = {
     "AD": "🇦🇩", "AE": "🇦🇪", "AF": "🇦🇫", "AG": "🇦🇬", "AL": "🇦🇱",
     "AM": "🇦🇲", "AO": "🇦🇴", "AR": "🇦🇷", "AT": "🇦🇹", "AU": "🇦🇺",
@@ -117,78 +113,63 @@ def flag(cc: str) -> str:
     return COUNTRY_FLAGS.get(cc.upper(), "🏳️")
 
 
-# ──────────────────────────────────────────────
-# Affichage des pays disponibles
-# ──────────────────────────────────────────────
-
 def display_countries(countries: dict, proxies: list):
-    """Affiche un tableau des pays disponibles avec nombre de proxies."""
-    # Construire un mapping code → nom
+    """Display a table of available countries with proxy counts."""
     name_map = {}
     for p in proxies:
         if p.country and p.country_name:
             name_map[p.country] = p.country_name
 
     table = Table(
-        title="🌍 Pays disponibles",
+        title="🌍 Available countries",
         box=box.ROUNDED,
         show_header=True,
         header_style="bold magenta",
         title_style="bold white",
     )
-    table.add_column("Drapeau", justify="center", no_wrap=True)
-    table.add_column("Code", justify="center", style="bold yellow", no_wrap=True)
-    table.add_column("Pays", style="white")
-    table.add_column("Proxies dispo", justify="right", style="green")
+    table.add_column("Flag",    justify="center", no_wrap=True)
+    table.add_column("Code",    justify="center", style="bold yellow", no_wrap=True)
+    table.add_column("Country", style="white")
+    table.add_column("Proxies", justify="right", style="green")
 
     for cc, count in countries.items():
-        name = name_map.get(cc, cc)
-        table.add_row(
-            flag(cc),
-            cc,
-            name,
-            str(count),
-        )
+        table.add_row(flag(cc), cc, name_map.get(cc, cc), str(count))
 
     console.print()
     console.print(table)
     console.print()
 
 
-# ──────────────────────────────────────────────
-# Sélection interactive du pays
-# ──────────────────────────────────────────────
-
 def select_country_interactive(countries: dict, proxies: list) -> str:
-    """Interface interactive de sélection de pays."""
+    """Interactive country selection prompt."""
     display_countries(countries, proxies)
-
     available_codes = set(countries.keys())
+
     while True:
         try:
-            console.print("[bold cyan]Entrez le code pays[/bold cyan] (ex: [yellow]FR[/yellow], [yellow]US[/yellow], [yellow]DE[/yellow]): ", end="")
+            console.print(
+                "[bold cyan]Enter country code[/bold cyan] "
+                "(e.g. [yellow]FR[/yellow], [yellow]US[/yellow], [yellow]DE[/yellow]): ",
+                end="",
+            )
             choice = input().strip().upper()
         except (EOFError, KeyboardInterrupt):
             sys.exit(0)
 
         if not choice:
-            console.print("[yellow]⚠ Entrée vide. Veuillez saisir un code pays valide (ex: FR, US, DE).[/yellow]")
+            console.print("[yellow]Empty input — please enter a valid country code (e.g. FR, US, DE).[/yellow]")
             continue
 
         if choice in available_codes:
             return choice
-        else:
-            console.print(f"[red]❌ Code pays '{choice}' non disponible. Choisissez parmi la liste ci-dessus.[/red]")
 
+        console.print(f"[red]Country '{choice}' not available. Choose from the list above.[/red]")
 
-# ──────────────────────────────────────────────
-# Affichage du statut de la chaîne
-# ──────────────────────────────────────────────
 
 def display_chain_status(proxy: Proxy, local_port: int, ip_info: dict):
-    """Affiche un panneau récapitulatif de la chaîne active."""
+    """Display a summary panel for the active proxy chain."""
     chain_visual = (
-        f"[bold white]Vous[/bold white] "
+        f"[bold white]You[/bold white] "
         f"[dim]──►[/dim] "
         f"[bold cyan]🧅 Tor[/bold cyan] "
         f"[dim]──►[/dim] "
@@ -198,56 +179,31 @@ def display_chain_status(proxy: Proxy, local_port: int, ip_info: dict):
         f"[bold green]🌐 Internet[/bold green]"
     )
 
-    ip_display = ip_info.get("ip", "?")
-    country_display = ip_info.get("country", "?")
-    city_display = ip_info.get("city", "?")
-    org_display = ip_info.get("org", "?")
+    latency_line = (
+        f"  [bold]Proxy latency     :[/bold]  [magenta]{proxy.latency_ms:.0f} ms[/magenta]"
+        if proxy.latency_ms > 0 else ""
+    )
 
-    content = "\n".join([
+    content = "\n".join(filter(None, [
         f"  {chain_visual}",
         "",
-        f"  [bold]IP publique finale :[/bold]  [bold green]{ip_display}[/bold green]",
-        f"  [bold]Pays détecté      :[/bold]  {country_display}",
-        f"  [bold]Ville             :[/bold]  {city_display}",
-        f"  [bold]Opérateur         :[/bold]  {org_display}",
+        f"  [bold]Public IP         :[/bold]  [bold green]{ip_info.get('ip', '?')}[/bold green]",
+        f"  [bold]Detected country  :[/bold]  {ip_info.get('country', '?')}",
+        f"  [bold]City              :[/bold]  {ip_info.get('city', '?')}",
+        f"  [bold]ISP               :[/bold]  {ip_info.get('org', '?')}",
         "",
-        f"  [bold]Proxy local SOCKS5:[/bold]  [cyan]socks5://127.0.0.1:{local_port}[/cyan]",
-        f"  [bold]Proxy exit        :[/bold]  [yellow]{proxy.proto}://{proxy.address}[/yellow]",
-        f"  [bold]Latence proxy     :[/bold]  [magenta]{proxy.latency_ms:.0f} ms[/magenta]" if proxy.latency_ms > 0 else "",
-    ])
+        f"  [bold]Local SOCKS5      :[/bold]  [cyan]socks5://127.0.0.1:{local_port}[/cyan]",
+        f"  [bold]Exit proxy        :[/bold]  [yellow]{proxy.proto}://{proxy.address}[/yellow]",
+        latency_line,
+    ]))
 
     console.print(Panel(
         content,
-        title="[bold green]⛓️  Chaîne active[/bold green]",
+        title="[bold green]⛓️  Active chain[/bold green]",
         border_style="green",
         padding=(1, 2),
     ))
 
-
-# ──────────────────────────────────────────────
-# Menu interactif principal (boucle active)
-# ──────────────────────────────────────────────
-
-def interactive_menu(server: ProxyChainServer, proxies_by_country: list, country: str, local_port: int):
-    """Menu interactif pendant que le serveur tourne."""
-    console.print()
-    console.print(Panel(
-        "[bold]Commandes disponibles :[/bold]\n\n"
-        "  [cyan]r[/cyan]  → Changer de proxy (rotation)\n"
-        "  [cyan]n[/cyan]  → Nouveau circuit Tor\n"
-        "  [cyan]i[/cyan]  → Vérifier l'IP actuelle\n"
-        "  [cyan]q[/cyan]  → Quitter",
-        title="⌨️  Contrôles",
-        border_style="blue",
-        padding=(0, 2),
-    ))
-
-    return  # Le menu est géré dans la boucle principale de run()
-
-
-# ──────────────────────────────────────────────
-# Cœur de l'application
-# ──────────────────────────────────────────────
 
 def run(
     country_arg: str,
@@ -255,193 +211,197 @@ def run(
     verbose: bool,
     list_countries_only: bool,
     skip_verify: bool,
+    tor_port_arg: int = None,
 ):
-    """Logique principale de l'outil."""
-
-    # Bannière
     console.print(BANNER)
     console.print()
 
-    # ── 1. Démarrage Tor ──
+    # ── Step 1: Tor ───────────────────────────────────────────────────────────
+    if tor_port_arg:
+        step1_label = f"Step 1/4: Attaching to existing Tor on port {tor_port_arg}"
+    else:
+        step1_label = "Step 1/4: Connecting to the Tor network"
+
     console.print(Panel(
-        "[bold cyan]Étape 1/4 :[/bold cyan] Connexion au réseau Tor",
-        border_style="cyan", padding=(0, 1)
+        f"[bold cyan]{step1_label}[/bold cyan]",
+        border_style="cyan", padding=(0, 1),
     ))
-    tor = TorManager()
+
+    tor = TorManager(external_port=tor_port_arg)
     if not tor.start():
-        console.print("[red]Impossible de démarrer Tor. Vérifiez l'installation.[/red]")
+        console.print("[red]Could not connect to Tor. Check your installation or --tor-port value.[/red]")
         sys.exit(1)
-    console.print(f"[green]✓ Tor opérationnel sur socks5://127.0.0.1:{TOR_SOCKS_PORT}[/green]")
+
+    active_tor_port = tor.socks_port
+    console.print(f"[green]Tor ready at socks5://127.0.0.1:{active_tor_port}[/green]")
     console.print()
 
-    # ── 2. Récupération des proxies ──
+    # ── Step 2: Fetch proxies ────────────────────────────────────────────────
     console.print(Panel(
-        "[bold cyan]Étape 2/4 :[/bold cyan] Récupération des proxies SOCKS publics",
-        border_style="cyan", padding=(0, 1)
+        "[bold cyan]Step 2/4: Fetching public SOCKS proxies[/bold cyan]",
+        border_style="cyan", padding=(0, 1),
     ))
     raw_proxies = fetch_all_proxies(verbose=verbose)
 
     if not raw_proxies:
-        console.print("[red]❌ Aucun proxy récupéré. Vérifiez votre connexion Internet.[/red]")
+        console.print("[red]No proxies fetched. Check your internet connection.[/red]")
         tor.stop()
         sys.exit(1)
 
-    # ── 3. Résolution des pays (avec cache SQLite) ──
+    # ── Step 3: Geolocation (with SQLite cache) ───────────────────────────────
     console.print()
-    console.print("[cyan]🌍 Résolution géographique des proxies...[/cyan]")
+    console.print("[cyan]Resolving proxy countries...[/cyan]")
 
-    # Charger le cache existant
     cached = load_cached_proxies()
     cache_map = {(p.host, p.port): p for p in cached}
     age = cache_age_hours()
 
     if cached:
         age_str = f"{age:.1f}h" if age is not None else "?"
-        console.print(f"[dim]  📦 Cache : {len(cached)} proxies géolocalisés (âge : {age_str})[/dim]")
+        console.print(f"[dim]  Cache: {len(cached)} geolocated proxies (age: {age_str})[/dim]")
 
-    # Appliquer le cache aux proxies scrapés
     for p in raw_proxies:
         cached_p = cache_map.get((p.host, p.port))
         if cached_p and cached_p.country:
             p.country = cached_p.country
             p.country_name = cached_p.country_name
 
-    # Ne résoudre que les proxies sans pays
     need_resolve = [p for p in raw_proxies if not p.country]
     if need_resolve:
-        console.print(f"[dim]  🔍 {len(need_resolve)} proxies à géolocaliser via ip-api.com...[/dim]")
-        proxies_with_geo = resolve_countries_batch(raw_proxies, via_tor_port=TOR_SOCKS_PORT)
-        # Sauvegarder les nouvellement résolus dans le cache
-        newly_resolved = [p for p in proxies_with_geo if p.country and (p.host, p.port) not in cache_map]
+        console.print(f"[dim]  Geolocating {len(need_resolve)} proxies via ip-api.com...[/dim]")
+        proxies_with_geo = resolve_countries_batch(raw_proxies, via_tor_port=active_tor_port)
+        newly_resolved = [
+            p for p in proxies_with_geo
+            if p.country and (p.host, p.port) not in cache_map
+        ]
         if newly_resolved:
             save_proxies_to_cache(newly_resolved)
-            console.print(f"[dim]  💾 {len(newly_resolved)} nouveaux proxies mis en cache[/dim]")
+            console.print(f"[dim]  Cached {len(newly_resolved)} new geolocation entries.[/dim]")
     else:
         proxies_with_geo = raw_proxies
-        console.print(f"[dim]  ✅ Tous les proxies déjà géolocalisés depuis le cache[/dim]")
+        console.print("[dim]  All proxies already geolocated from cache.[/dim]")
 
     countries = get_countries_available(proxies_with_geo)
-    console.print(f"[green]✓ {len(countries)} pays disponibles avec {sum(countries.values())} proxies géolocalisés[/green]")
+    console.print(
+        f"[green]{len(countries)} countries available "
+        f"({sum(countries.values())} geolocated proxies)[/green]"
+    )
     console.print()
 
-    # Mode liste uniquement
     if list_countries_only:
         display_countries(countries, proxies_with_geo)
         tor.stop()
         return
 
+    # ── Country selection ─────────────────────────────────────────────────────
+    console.print(Panel(
+        "[bold cyan]Step 3/4: Selecting exit country[/bold cyan]",
+        border_style="cyan", padding=(0, 1),
+    ))
+
     if not countries:
-        console.print("[yellow]⚠ Aucun proxy géolocalisé. Utilisation sans filtre pays...[/yellow]")
+        console.print("[yellow]No geolocated proxies — proceeding without country filter.[/yellow]")
         proxies_with_geo = raw_proxies
         selected_country = None
-    else:
-        # ── Sélection du pays ──
-        console.print(Panel(
-            "[bold cyan]Étape 3/4 :[/bold cyan] Sélection du pays de sortie",
-            border_style="cyan", padding=(0, 1)
-        ))
-
-        if country_arg:
-            cc = country_arg.upper().strip()
-            if cc not in countries:
-                console.print(f"[yellow]⚠ Pays '{cc}' non disponible dans la liste actuelle.[/yellow]")
-                console.print("[yellow]  Pays disponibles :[/yellow]", ", ".join(sorted(countries.keys())))
-                cc = select_country_interactive(countries, proxies_with_geo)
-            else:
-                console.print(f"[green]✓ Pays sélectionné : {flag(cc)} [bold]{cc}[/bold] ({countries[cc]} proxies disponibles)[/green]")
-            selected_country = cc
+    elif country_arg:
+        cc = country_arg.upper().strip()
+        if cc not in countries:
+            console.print(f"[yellow]Country '{cc}' not in current list.[/yellow]")
+            cc = select_country_interactive(countries, proxies_with_geo)
         else:
-            selected_country = select_country_interactive(countries, proxies_with_geo)
-            console.print(f"[green]✓ Pays sélectionné : {flag(selected_country)} [bold]{selected_country}[/bold][/green]")
+            console.print(
+                f"[green]Country: {flag(cc)} [bold]{cc}[/bold] "
+                f"({countries[cc]} proxies available)[/green]"
+            )
+        selected_country = cc
+    else:
+        selected_country = select_country_interactive(countries, proxies_with_geo)
+        console.print(f"[green]Country: {flag(selected_country)} [bold]{selected_country}[/bold][/green]")
 
     console.print()
 
-    # ── Filtrage et vérification des proxies ──
+    # ── Step 4: Verify and activate ──────────────────────────────────────────
     console.print(Panel(
-        "[bold cyan]Étape 4/4 :[/bold cyan] Vérification et activation de la chaîne",
-        border_style="cyan", padding=(0, 1)
+        "[bold cyan]Step 4/4: Verifying proxies and activating chain[/bold cyan]",
+        border_style="cyan", padding=(0, 1),
     ))
 
     if selected_country:
         candidates = filter_by_country(proxies_with_geo, selected_country)
-        console.print(f"[cyan]{len(candidates)} proxies trouvés pour {flag(selected_country)} {selected_country}[/cyan]")
+        console.print(f"[cyan]{len(candidates)} proxies found for {flag(selected_country)} {selected_country}[/cyan]")
     else:
         candidates = proxies_with_geo
 
     if not candidates:
-        console.print(f"[red]❌ Aucun proxy disponible pour ce pays.[/red]")
+        console.print("[red]No proxies available for this country.[/red]")
         tor.stop()
         sys.exit(1)
 
-    # Vérifier les proxies (via Tor pour authentifier l'accessibilité réelle)
     if not skip_verify:
-        console.print("[cyan]🔍 Vérification des proxies via Tor...[/cyan]")
+        console.print("[cyan]Checking proxies through Tor...[/cyan]")
         alive_proxies = check_proxies(
-            candidates[:200],  # Limiter à 200 pour la vitesse
-            via_tor_port=TOR_SOCKS_PORT,
+            candidates[:200],
+            via_tor_port=active_tor_port,
             max_workers=20,
         )
     else:
         alive_proxies = candidates
 
     if not alive_proxies:
-        console.print("[red]❌ Aucun proxy vivant trouvé pour ce pays.[/red]")
-        console.print("[yellow]💡 Essayez un autre pays ou relancez sans --skip-verify.[/yellow]")
+        console.print("[red]No live proxies found for this country.[/red]")
+        console.print("[yellow]Try another country or run without --skip-verify.[/yellow]")
         tor.stop()
         sys.exit(1)
 
-    console.print(f"[green]✓ {len(alive_proxies)} proxies vivants[/green]")
+    console.print(f"[green]{len(alive_proxies)} live proxies found.[/green]")
 
-    # Choisir le meilleur proxy (latence la plus faible)
     active_proxy = alive_proxies[0]
     console.print(
-        f"[green]✓ Proxy sélectionné : [bold]{active_proxy.address}[/bold] "
-        f"(latence: {active_proxy.latency_ms:.0f}ms)[/green]"
+        f"[green]Selected proxy: [bold]{active_proxy.address}[/bold] "
+        f"(latency: {active_proxy.latency_ms:.0f} ms)[/green]"
     )
     console.print()
 
-    # ── Démarrage du serveur de chainage ──
+    # ── Start chain server ────────────────────────────────────────────────────
     server = ProxyChainServer(
         exit_proxy=active_proxy,
-        tor_port=TOR_SOCKS_PORT,
+        tor_port=active_tor_port,
         local_port=local_port,
     )
     if not server.start():
         tor.stop()
         sys.exit(1)
 
-    # Enregistrer le PID pour pouvoir tuer le serveur plus tard
     write_pid(os.getpid(), local_port, selected_country or "ALL")
 
-    # ── Vérification de l'IP finale ──
-    console.print("[cyan]🌐 Vérification de l'IP publique finale...[/cyan]")
+    console.print("[cyan]Verifying final public IP...[/cyan]")
     time.sleep(2)
     ip_info = get_chained_ip(local_port=local_port)
 
     if ip_info:
         display_chain_status(active_proxy, local_port, ip_info)
     else:
-        console.print("[yellow]⚠ Impossible de vérifier l'IP finale (proxy peut-être lent).[/yellow]")
-        console.print(f"[cyan]  Le serveur SOCKS5 est actif sur socks5://127.0.0.1:{local_port}[/cyan]")
+        console.print("[yellow]Could not verify final IP (proxy may be slow).[/yellow]")
+        console.print(f"[cyan]SOCKS5 server is active at socks5://127.0.0.1:{local_port}[/cyan]")
 
-    # ── Boucle interactive ──
+    # ── Interactive loop ──────────────────────────────────────────────────────
     proxy_index = 0
 
     console.print()
     console.print(Panel(
-        "[bold]Commandes :[/bold]\n\n"
-        "  [cyan][r][/cyan] → Rotation du proxy de sortie\n"
-        "  [cyan][n][/cyan] → Nouveau circuit Tor\n"
-        "  [cyan][i][/cyan] → Vérifier l'IP actuelle\n"
-        "  [cyan][d][/cyan] → Détacher (quitter sans arrêter le serveur)\n"
-        "  [cyan][q][/cyan] → Quitter et arrêter le serveur",
-        title="⌨️  Contrôles",
+        "[bold]Controls:[/bold]\n\n"
+        "  [cyan][r][/cyan] → Rotate exit proxy\n"
+        "  [cyan][n][/cyan] → New Tor circuit\n"
+        "  [cyan][i][/cyan] → Check current IP\n"
+        "  [cyan][d][/cyan] → Detach (exit UI, keep server running)\n"
+        "  [cyan][q][/cyan] → Quit and stop server",
+        title="⌨️  Controls",
         border_style="blue",
         padding=(0, 2),
     ))
 
     def signal_handler(sig, frame):
-        console.print("\n[yellow]⚡ Signal reçu, arrêt...[/yellow]")
+        console.print("\n[yellow]Signal received, shutting down...[/yellow]")
         server.stop()
         tor.stop()
         clear_pid()
@@ -465,49 +425,47 @@ def run(
             break
 
         elif cmd == "d":
-            # Détacher : quitter sans arrêter le serveur
             detached = True
             console.print(Panel(
-                f"[bold green]Le serveur tourne en arrière-plan.[/bold green]\n\n"
-                f"  🔌 Proxy SOCKS5 actif : [cyan]socks5://127.0.0.1:{local_port}[/cyan]\n"
-                f"  🆔 PID : [yellow]{os.getpid()}[/yellow]\n\n"
-                f"  Pour arrêter plus tard :\n"
+                f"[bold green]Server running in the background.[/bold green]\n\n"
+                f"  SOCKS5 proxy active: [cyan]socks5://127.0.0.1:{local_port}[/cyan]\n"
+                f"  PID: [yellow]{os.getpid()}[/yellow]\n\n"
+                f"  To stop later:\n"
                 f"  [dim]python main.py --kill[/dim]\n"
-                f"  [dim]ou :[/dim]  [dim]kill {os.getpid()}[/dim]",
-                title="⛓️  Détaché",
+                f"  [dim]or:  kill {os.getpid()}[/dim]",
+                title="⛓️  Detached",
                 border_style="green",
                 padding=(1, 2),
             ))
             break
 
         elif cmd == "r":
-            # Rotation : passer au proxy suivant
             proxy_index = (proxy_index + 1) % len(alive_proxies)
             new_proxy = alive_proxies[proxy_index]
             server.swap_exit_proxy(new_proxy)
-            console.print(f"[cyan]🔄 Nouveau proxy : {flag(new_proxy.country)} {new_proxy.address} ({new_proxy.latency_ms:.0f}ms)[/cyan]")
+            console.print(
+                f"[cyan]Rotated → {flag(new_proxy.country)} {new_proxy.address} "
+                f"({new_proxy.latency_ms:.0f} ms)[/cyan]"
+            )
 
         elif cmd == "n":
-            # Nouveau circuit Tor
             tor.new_circuit()
 
         elif cmd == "i":
-            # Vérifier l'IP actuelle
-            console.print("[cyan]🌐 Vérification de l'IP...[/cyan]")
+            console.print("[cyan]Checking current IP...[/cyan]")
             ip_info = get_chained_ip(local_port=local_port)
             if ip_info:
                 console.print(
-                    f"[green]  IP : [bold]{ip_info['ip']}[/bold] | "
-                    f"Pays : {ip_info['country']} | "
-                    f"Ville : {ip_info['city']} | "
-                    f"Org : {ip_info['org']}[/green]"
+                    f"[green]  IP: [bold]{ip_info['ip']}[/bold] | "
+                    f"Country: {ip_info['country']} | "
+                    f"City: {ip_info['city']} | "
+                    f"ISP: {ip_info['org']}[/green]"
                 )
             else:
-                console.print("[yellow]  Impossible de récupérer l'IP.[/yellow]")
+                console.print("[yellow]  Could not retrieve IP.[/yellow]")
 
     if detached:
-        # Le serveur continue de tourner, on garde le processus en vie silencieusement
-        console.print("[dim]Session détachée. Le proxy reste actif. (Ctrl+C pour forcer l'arrêt)[/dim]")
+        console.print("[dim]Detached session. Proxy remains active. (Ctrl+C to force stop)[/dim]")
         try:
             while True:
                 time.sleep(60)
@@ -518,90 +476,50 @@ def run(
         clear_pid()
         return
 
-    # ── Nettoyage ──
-    console.print("\n[yellow]⏹ Arrêt du serveur...[/yellow]")
+    console.print("\n[yellow]Stopping server...[/yellow]")
     server.stop()
     tor.stop()
     clear_pid()
-    console.print("[green]✓ Arrêt propre. À bientôt ![/green]")
+    console.print("[green]Clean shutdown. Goodbye![/green]")
 
 
-# ──────────────────────────────────────────────
-# Interface Click (CLI)
-# ──────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 @click.command(help=__doc__)
-@click.option(
-    "--country", "-c",
-    default=None,
-    metavar="CODE",
-    help="Code pays ISO 2 lettres (ex: FR, US, DE). Mode interactif si non spécifié.",
-)
-@click.option(
-    "--list-countries", "-l",
-    is_flag=True,
-    default=False,
-    help="Afficher les pays disponibles et quitter.",
-)
-@click.option(
-    "--local-port", "-p",
-    default=DEFAULT_LOCAL_PORT,
-    show_default=True,
-    type=int,
-    help="Port du serveur SOCKS5 local.",
-)
-@click.option(
-    "--verbose", "-v",
-    is_flag=True,
-    default=False,
-    help="Affichage détaillé.",
-)
-@click.option(
-    "--skip-verify",
-    is_flag=True,
-    default=False,
-    help="Ne pas vérifier les proxies avant utilisation (plus rapide).",
-)
-@click.option(
-    "--kill", "-k",
-    is_flag=True,
-    default=False,
-    help="Arrêter un serveur TorProxy-Chain détaché en arrière-plan.",
-)
-@click.option(
-    "--clear-cache",
-    is_flag=True,
-    default=False,
-    help="Vider le cache SQLite de géolocalisation des proxies.",
-)
-def main(country, list_countries, local_port, verbose, skip_verify, kill, clear_cache):
-    # ── Commande : tuer le serveur détaché ──
+@click.option("--country",        "-c", default=None,               metavar="CODE",  help="ISO 2-letter exit country code (e.g. FR, US, DE). Interactive if omitted.")
+@click.option("--list-countries", "-l", is_flag=True, default=False,                 help="List available countries and exit.")
+@click.option("--local-port",     "-p", default=DEFAULT_LOCAL_PORT,  show_default=True, type=int, help="Local SOCKS5 server port.")
+@click.option("--tor-port",             default=None,                type=int,        help="Use an already-running Tor SOCKS port (skip starting Tor).")
+@click.option("--verbose",        "-v", is_flag=True, default=False,                 help="Verbose output.")
+@click.option("--skip-verify",          is_flag=True, default=False,                 help="Skip proxy liveness check (faster startup).")
+@click.option("--kill",           "-k", is_flag=True, default=False,                 help="Stop a detached TorProxy-Chain server.")
+@click.option("--clear-cache",          is_flag=True, default=False,                 help="Clear the proxy geolocation SQLite cache.")
+def main(country, list_countries, local_port, tor_port, verbose, skip_verify, kill, clear_cache):
     if kill:
         info = read_pid()
         if not info:
-            console.print("[yellow]⚠ Aucun serveur TorProxy-Chain actif trouvé.[/yellow]")
+            console.print("[yellow]No active TorProxy-Chain server found.[/yellow]")
             return
         pid = info["pid"]
         console.print(
-            f"[cyan]⏹ Arrêt du serveur détaché "
-            f"(PID {pid}, port {info['local_port']}, pays {info['country']})...[/cyan]"
+            f"[cyan]Stopping detached server "
+            f"(PID {pid}, port {info['local_port']}, country {info['country']})...[/cyan]"
         )
         try:
             os.kill(pid, signal.SIGTERM)
-            console.print(f"[green]✓ Signal SIGTERM envoyé au PID {pid}.[/green]")
+            console.print(f"[green]SIGTERM sent to PID {pid}.[/green]")
             clear_pid()
         except ProcessLookupError:
-            console.print(f"[yellow]⚠ Le processus {pid} n'existe plus. Nettoyage du PID.[/yellow]")
+            console.print(f"[yellow]Process {pid} no longer exists. Cleaning up PID file.[/yellow]")
             clear_pid()
         except PermissionError:
-            console.print(f"[red]❌ Permission refusée pour terminer le PID {pid}.[/red]")
+            console.print(f"[red]Permission denied to terminate PID {pid}.[/red]")
         return
 
-    # ── Commande : vider le cache ──
     if clear_cache:
         from proxy_cache import clear_cache as _clear_cache
         _clear_cache()
-        console.print("[green]✓ Cache SQLite vidé.[/green]")
+        console.print("[green]SQLite cache cleared.[/green]")
         return
 
     run(
@@ -610,6 +528,7 @@ def main(country, list_countries, local_port, verbose, skip_verify, kill, clear_
         verbose=verbose,
         list_countries_only=list_countries,
         skip_verify=skip_verify,
+        tor_port_arg=tor_port,
     )
 
 

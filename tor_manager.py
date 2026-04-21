@@ -1,6 +1,6 @@
 """
-Gestionnaire de connexion Tor.
-Démarre, contrôle et surveille le processus Tor local.
+Tor connection manager.
+Starts, controls and monitors the local Tor process.
 """
 
 import subprocess
@@ -31,37 +31,35 @@ TOR_CONTROL_PASSWORD = "torproxy_chain_secret"
 TOR_DATA_DIR = "/tmp/torproxy_chain_data"
 
 
-def is_tor_running() -> bool:
-    """Vérifie si Tor est déjà en écoute sur le port SOCKS."""
+def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Return True if a TCP listener is reachable on host:port."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2)
-        result = s.connect_ex(("127.0.0.1", TOR_SOCKS_PORT))
+        s.settimeout(timeout)
+        result = s.connect_ex((host, port))
         s.close()
         return result == 0
     except Exception:
         return False
 
 
+def is_tor_running(port: int = TOR_SOCKS_PORT) -> bool:
+    """Check whether Tor is already listening on the given SOCKS port."""
+    return _port_open("127.0.0.1", port)
+
+
 def is_tor_installed() -> bool:
-    """Vérifie si tor est installé sur le système."""
-    result = subprocess.run(
-        ["which", "tor"],
-        capture_output=True,
-        text=True
-    )
+    """Check whether the tor binary is available on this system."""
+    result = subprocess.run(["which", "tor"], capture_output=True, text=True)
     return result.returncode == 0
 
 
-def get_tor_config() -> str:
-    """Génère la configuration Tor."""
+def _get_tor_config() -> str:
+    """Generate a minimal torrc configuration."""
     os.makedirs(TOR_DATA_DIR, exist_ok=True)
-
-    # Hash du mot de passe pour le port de contrôle
     hash_result = subprocess.run(
         ["tor", "--hash-password", TOR_CONTROL_PASSWORD],
-        capture_output=True,
-        text=True
+        capture_output=True, text=True,
     )
     hashed_pw = ""
     if hash_result.returncode == 0:
@@ -70,50 +68,73 @@ def get_tor_config() -> str:
                 hashed_pw = line.strip()
                 break
 
-    config = f"""SocksPort {TOR_SOCKS_PORT}
-ControlPort {TOR_CONTROL_PORT}
-DataDirectory {TOR_DATA_DIR}
-Log notice stdout
-"""
+    config = (
+        f"SocksPort {TOR_SOCKS_PORT}\n"
+        f"ControlPort {TOR_CONTROL_PORT}\n"
+        f"DataDirectory {TOR_DATA_DIR}\n"
+        "Log notice stdout\n"
+    )
     if hashed_pw:
         config += f"HashedControlPassword {hashed_pw}\n"
-
     return config
 
 
 class TorManager:
-    """Gestionnaire du processus Tor."""
+    """
+    Manages the Tor process.
 
-    def __init__(self):
+    Pass external_port to reuse an already-running Tor instance instead of
+    starting a new one. The instance will not be stopped on close.
+    """
+
+    def __init__(self, external_port: Optional[int] = None):
+        self.external_port = external_port
+        self._socks_port: int = external_port if external_port else TOR_SOCKS_PORT
         self.tor_process: Optional[subprocess.Popen] = None
         self.controller: Optional["Controller"] = None
-        self._using_existing = False
+        self._using_existing = external_port is not None
+
+    @property
+    def socks_port(self) -> int:
+        return self._socks_port
 
     def start(self) -> bool:
-        """Démarre Tor ou se connecte à une instance existante."""
+        """Start Tor or attach to an existing instance."""
+        if self.external_port:
+            if not _port_open("127.0.0.1", self.external_port):
+                console.print(
+                    f"[red]No SOCKS listener found on port {self.external_port}. "
+                    "Make sure Tor is running.[/red]"
+                )
+                return False
+            console.print(
+                f"[yellow]Using existing Tor at "
+                f"socks5://127.0.0.1:{self.external_port}[/yellow]"
+            )
+            self._connect_controller_no_auth()
+            return True
+
         if is_tor_running():
-            console.print("[yellow]⚡ Tor déjà actif sur le port 9050, connexion à l'instance existante...[/yellow]")
+            console.print(
+                "[yellow]Tor already running on port 9050, attaching to existing instance...[/yellow]"
+            )
             self._using_existing = True
-            return self._connect_controller_no_auth()
+            self._connect_controller_no_auth()
+            return True
 
         if not is_tor_installed():
-            console.print("[red]❌ Tor n'est pas installé.[/red]")
-            console.print("[cyan]   Installez-le avec : [bold]sudo apt install tor[/bold][/cyan]")
+            console.print("[red]Tor is not installed.[/red]")
+            console.print("[cyan]Install it with: [bold]sudo apt install tor[/bold][/cyan]")
             return False
 
         return self._start_tor_process()
 
     def _start_tor_process(self) -> bool:
-        """Lance le processus Tor avec stem."""
-        console.print("[cyan]🧅 Démarrage de Tor...[/cyan]")
-
         if STEM_AVAILABLE:
             return self._start_with_stem()
-        else:
-            return self._start_with_subprocess()
+        return self._start_with_subprocess()
 
     def _start_with_stem(self) -> bool:
-        """Démarre Tor via stem."""
         try:
             with Progress(
                 SpinnerColumn(),
@@ -121,12 +142,11 @@ class TorManager:
                 transient=True,
                 console=console,
             ) as progress:
-                task = progress.add_task("Connexion au réseau Tor...", total=None)
-
+                task = progress.add_task("Connecting to the Tor network...", total=None)
                 config_path = os.path.join(TOR_DATA_DIR, "torrc")
                 os.makedirs(TOR_DATA_DIR, exist_ok=True)
                 with open(config_path, "w") as f:
-                    f.write(get_tor_config())
+                    f.write(_get_tor_config())
 
                 self.tor_process = stem.process.launch_tor_with_config(
                     config={
@@ -139,55 +159,52 @@ class TorManager:
                     init_msg_handler=lambda line: None,
                     take_ownership=True,
                 )
-                progress.update(task, description="[green]✓ Tor connecté !")
+                progress.update(task, description="[green]Tor connected!")
 
             self._connect_controller()
             return True
 
         except OSError as e:
-            console.print(f"[red]❌ Erreur démarrage Tor (stem): {e}[/red]")
+            console.print(f"[red]Tor startup error (stem): {e}[/red]")
             return self._start_with_subprocess()
 
     def _start_with_subprocess(self) -> bool:
-        """Démarre Tor via subprocess (fallback)."""
         try:
             config_path = os.path.join(TOR_DATA_DIR, "torrc")
             os.makedirs(TOR_DATA_DIR, exist_ok=True)
             with open(config_path, "w") as f:
-                f.write(get_tor_config())
+                f.write(_get_tor_config())
 
             self.tor_process = subprocess.Popen(
                 ["tor", "-f", config_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
             )
 
-            # Attendre que Tor soit prêt
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 transient=True,
                 console=console,
             ) as progress:
-                task = progress.add_task("Connexion au réseau Tor...", total=None)
+                task = progress.add_task("Connecting to the Tor network...", total=None)
                 deadline = time.time() + 60
                 bootstrapped = False
 
                 while time.time() < deadline:
                     if self.tor_process.poll() is not None:
-                        console.print("[red]❌ Tor s'est arrêté prématurément[/red]")
+                        console.print("[red]Tor exited prematurely.[/red]")
                         return False
-
                     if is_tor_running():
                         bootstrapped = True
                         break
                     time.sleep(1)
 
                 if bootstrapped:
-                    progress.update(task, description="[green]✓ Tor connecté !")
+                    progress.update(task, description="[green]Tor connected!")
                 else:
-                    console.print("[red]❌ Timeout: Tor n'a pas démarré dans les 60 secondes[/red]")
+                    console.print("[red]Timeout: Tor did not start within 60 seconds.[/red]")
                     self.stop()
                     return False
 
@@ -195,15 +212,14 @@ class TorManager:
             return True
 
         except Exception as e:
-            console.print(f"[red]❌ Erreur démarrage Tor: {e}[/red]")
+            console.print(f"[red]Tor startup error: {e}[/red]")
             return False
 
     def _get_hashed_password(self) -> str:
-        """Retourne le hash du mot de passe de contrôle."""
         try:
             result = subprocess.run(
                 ["tor", "--hash-password", TOR_CONTROL_PASSWORD],
-                capture_output=True, text=True
+                capture_output=True, text=True,
             )
             for line in result.stdout.strip().split("\n"):
                 if line.startswith("16:"):
@@ -213,7 +229,6 @@ class TorManager:
         return ""
 
     def _connect_controller(self) -> bool:
-        """Connecte le contrôleur Tor avec authentification."""
         if not STEM_AVAILABLE:
             return True
         try:
@@ -225,7 +240,7 @@ class TorManager:
             return self._connect_controller_no_auth()
 
     def _connect_controller_no_auth(self) -> bool:
-        """Connecte le contrôleur sans mot de passe (instance existante)."""
+        """Attach to control port without password (existing instance)."""
         if not STEM_AVAILABLE:
             return True
         try:
@@ -233,48 +248,37 @@ class TorManager:
             self.controller.authenticate()
             return True
         except Exception:
-            # Pas de port de contrôle disponible, on continue sans
+            # No control port available — continue without it
             return True
 
     def new_circuit(self) -> bool:
-        """Force un nouveau circuit Tor (nouvelle identité)."""
+        """Request a new Tor circuit (new identity)."""
         if self.controller:
             try:
                 self.controller.signal(stem.Signal.NEWNYM)
-                console.print("[cyan]🔄 Nouveau circuit Tor établi[/cyan]")
-                time.sleep(3)  # Attendre que le circuit soit établi
+                console.print("[cyan]New Tor circuit established.[/cyan]")
+                time.sleep(3)
                 return True
             except Exception as e:
-                console.print(f"[yellow]⚠ Impossible de changer le circuit: {e}[/yellow]")
+                console.print(f"[yellow]Could not rotate circuit: {e}[/yellow]")
         return False
 
-    def get_exit_ip_via_tor(self) -> Optional[str]:
-        """Récupère l'IP de sortie Tor actuelle."""
+    def get_exit_ip(self) -> Optional[str]:
+        """Return the current Tor exit IP."""
         import requests
         proxies = {
-            "http": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
-            "https": f"socks5h://127.0.0.1:{TOR_SOCKS_PORT}",
+            "http": f"socks5h://127.0.0.1:{self._socks_port}",
+            "https": f"socks5h://127.0.0.1:{self._socks_port}",
         }
-        try:
-            resp = requests.get(
-                "https://api.ipify.org",
-                proxies=proxies,
-                timeout=15
-            )
-            return resp.text.strip()
-        except Exception:
+        for url in ("https://api.ipify.org", "http://checkip.amazonaws.com"):
             try:
-                resp = requests.get(
-                    "http://checkip.amazonaws.com",
-                    proxies=proxies,
-                    timeout=15
-                )
-                return resp.text.strip()
+                return requests.get(url, proxies=proxies, timeout=15).text.strip()
             except Exception:
-                return None
+                continue
+        return None
 
     def stop(self):
-        """Arrête le processus Tor si on l'a démarré nous-mêmes."""
+        """Stop Tor if we started it ourselves."""
         if self.controller:
             try:
                 self.controller.close()
