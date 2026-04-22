@@ -20,6 +20,7 @@ import sys
 import time
 import signal
 import os
+import logging
 from typing import List, Optional, Set
 import click
 from pathlib import Path
@@ -58,6 +59,16 @@ from mitm_check import (
 )
 
 console = Console()
+
+
+def _setup_logging(verbose: bool):
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    logging.basicConfig(stream=sys.stdout, level=level, format=fmt, datefmt="%Y-%m-%d %H:%M:%S")
+    # Silence noisy third-party loggers
+    for noisy in ("urllib3", "requests", "stem", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 DEFAULT_TRIGGER_HOSTS = {"accounts.censys.io"}
 
@@ -257,7 +268,9 @@ def run(
     fail_threshold: int = 3,
     rate_limit_hosts: Optional[str] = None,
     headless: bool = False,
+    status_port: Optional[int] = None,
 ):
+    _setup_logging(verbose)
     console.print(BANNER)
     console.print()
 
@@ -427,6 +440,7 @@ def run(
         watchdog_interval=watchdog_interval,
         fail_threshold=fail_threshold,
         trigger_hosts=DEFAULT_TRIGGER_HOSTS | extra_hosts,
+        status_port=status_port,
     )
     if not server.start():
         tor.stop()
@@ -591,7 +605,8 @@ def run(
 @click.option("--fail-threshold",         default=3,    show_default=True, type=int,     help="Consecutive failures before auto-rotation.")
 @click.option("--rate-limit-hosts",       default="",                                    help="Extra redirect hostnames that trigger auto-rotation (comma-separated).")
 @click.option("--headless",               is_flag=True, default=False,                   help="Headless mode: no interactive prompts, block until SIGTERM.")
-def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts, headless):
+@click.option("--status-port",            default=None, type=int,                        help="Enable HTTP status API on this port (e.g. 10801).")
+def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts, headless, status_port):
     if kill:
         info = read_pid()
         if not info:
@@ -635,6 +650,7 @@ def main(country, list_countries, local_port, tor_port, verbose, skip_verify, sk
         fail_threshold=fail_threshold,
         rate_limit_hosts=rate_limit_hosts or None,
         headless=headless,
+        status_port=status_port,
     )
 
 

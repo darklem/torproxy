@@ -1,15 +1,16 @@
 """
 Public SOCKS proxy scraper from multiple sources.
 Fetches, deduplicates and filters proxies by country.
+
+Sources are defined in proxy_sources.py — edit that file to add new ones.
 """
 
-import re
 import time
 import socket
+import logging
 import concurrent.futures
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
-from urllib.parse import urlparse
 
 import requests
 import socks
@@ -17,7 +18,10 @@ import socks
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
+from proxy_sources import SOURCES
+
 console = Console()
+logger = logging.getLogger(__name__)
 
 PROXY_CHECK_TIMEOUT = 8
 MAX_CHECK_WORKERS = 30
@@ -52,155 +56,30 @@ class Proxy:
         return isinstance(other, Proxy) and self.host == other.host and self.port == other.port
 
 
-# ── Proxy sources ─────────────────────────────────────────────────────────────
+# ── Generic text fetcher ──────────────────────────────────────────────────────
 
-def _fetch_proxyscrape_socks5() -> List[Proxy]:
-    """proxyscrape.com — SOCKS5."""
+def _fetch_text_url(url: str, proto: str) -> List[Proxy]:
+    """Fetch a plain-text proxy list (one IP:PORT per line)."""
     proxies = []
-    urls = [
-        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_type=socks5&timeout=10000&country=all&simplified=true",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=15)
-            for line in r.text.strip().splitlines():
-                line = line.strip()
-                if ":" in line:
-                    host, port_s = line.rsplit(":", 1)
-                    try:
-                        proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks5"))
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
-    return proxies
-
-
-def _fetch_proxyscrape_socks4() -> List[Proxy]:
-    """proxyscrape.com — SOCKS4."""
-    proxies = []
-    urls = [
-        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_type=socks4&timeout=10000&country=all&simplified=true",
-        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=15)
-            for line in r.text.strip().splitlines():
-                line = line.strip()
-                if ":" in line:
-                    host, port_s = line.rsplit(":", 1)
-                    try:
-                        proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks4"))
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
-    return proxies
-
-
-def _fetch_github_hookzof() -> List[Proxy]:
-    """hookzof/socks5_list on GitHub."""
-    proxies = []
-    url = "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"
     try:
         r = requests.get(url, timeout=15)
         for line in r.text.strip().splitlines():
-            line = line.strip()
+            line = line.strip().split()[0]   # strip inline comments
             if ":" in line:
                 host, port_s = line.rsplit(":", 1)
                 try:
-                    proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks5"))
+                    proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto=proto))
                 except ValueError:
                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"fetch_text_url({url}): {e}")
     return proxies
 
 
-def _fetch_github_proxifly() -> List[Proxy]:
-    """proxifly/proxy-list — SOCKS5 with country."""
-    proxies = []
-    url = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"
-    try:
-        r = requests.get(url, timeout=15)
-        for line in r.text.strip().splitlines():
-            line = line.strip()
-            if ":" in line:
-                host, port_s = line.rsplit(":", 1)
-                try:
-                    proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks5"))
-                except ValueError:
-                    pass
-    except Exception:
-        pass
-    return proxies
-
-
-def _fetch_github_thespeedx() -> List[Proxy]:
-    """TheSpeedX/PROXY-List — SOCKS5."""
-    proxies = []
-    url = "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"
-    try:
-        r = requests.get(url, timeout=15)
-        for line in r.text.strip().splitlines():
-            line = line.strip()
-            if ":" in line:
-                host, port_s = line.rsplit(":", 1)
-                try:
-                    proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks5"))
-                except ValueError:
-                    pass
-    except Exception:
-        pass
-    return proxies
-
-
-def _fetch_github_thespeedx_s4() -> List[Proxy]:
-    """TheSpeedX/PROXY-List — SOCKS4."""
-    proxies = []
-    url = "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt"
-    try:
-        r = requests.get(url, timeout=15)
-        for line in r.text.strip().splitlines():
-            line = line.strip()
-            if ":" in line:
-                host, port_s = line.rsplit(":", 1)
-                try:
-                    proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks4"))
-                except ValueError:
-                    pass
-    except Exception:
-        pass
-    return proxies
-
-
-def _fetch_github_monosans() -> List[Proxy]:
-    """monosans/proxy-list — SOCKS5."""
-    proxies = []
-    urls = [
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks5.txt",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=15)
-            for line in r.text.strip().splitlines():
-                line = line.strip().split()[0]  # strip trailing comments
-                if ":" in line:
-                    host, port_s = line.rsplit(":", 1)
-                    try:
-                        proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks5"))
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
-    return proxies
-
+# ── Special JSON sources ──────────────────────────────────────────────────────
 
 def _fetch_proxylist_download() -> List[Proxy]:
-    """proxy-list.download — SOCKS5 with country."""
+    """proxy-list.download — SOCKS5 with country (JSON API)."""
     proxies = []
     try:
         r = requests.get(
@@ -222,26 +101,8 @@ def _fetch_proxylist_download() -> List[Proxy]:
                     ))
                 except ValueError:
                     pass
-    except Exception:
-        pass
-    return proxies
-
-
-def _fetch_openproxylist() -> List[Proxy]:
-    """openproxylist.xyz — SOCKS5."""
-    proxies = []
-    try:
-        r = requests.get("https://openproxylist.xyz/socks5.txt", timeout=15)
-        for line in r.text.strip().splitlines():
-            line = line.strip()
-            if ":" in line:
-                host, port_s = line.rsplit(":", 1)
-                try:
-                    proxies.append(Proxy(host=host.strip(), port=int(port_s.strip()), proto="socks5"))
-                except ValueError:
-                    pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"fetch_proxylist_download: {e}")
     return proxies
 
 
@@ -394,55 +255,54 @@ def check_proxies(
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-SCRAPERS = [
-    ("proxyscrape SOCKS5",   _fetch_proxyscrape_socks5),
-    ("proxyscrape SOCKS4",   _fetch_proxyscrape_socks4),
-    ("GitHub hookzof",       _fetch_github_hookzof),
-    ("GitHub proxifly",      _fetch_github_proxifly),
-    ("GitHub TheSpeedX S5",  _fetch_github_thespeedx),
-    ("GitHub TheSpeedX S4",  _fetch_github_thespeedx_s4),
-    ("GitHub monosans",      _fetch_github_monosans),
-    ("proxy-list.download",  _fetch_proxylist_download),
-    ("openproxylist.xyz",    _fetch_openproxylist),
+# Special sources that require a custom fetcher (JSON API, etc.)
+_SPECIAL_SOURCES = [
+    ("proxy-list.download", _fetch_proxylist_download),
 ]
 
 
 def fetch_all_proxies(verbose: bool = False) -> List[Proxy]:
-    """Fetch proxies from all sources and deduplicate."""
+    """Fetch proxies from all sources (proxy_sources.py + special) and deduplicate."""
     all_proxies: List[Proxy] = []
-    seen = set()
+    seen: set = set()
+    total = len(SOURCES) + len(_SPECIAL_SOURCES)
+
+    def _add(found: List[Proxy], name: str):
+        new = 0
+        for p in found:
+            key = (p.host, p.port)
+            if key not in seen:
+                seen.add(key)
+                all_proxies.append(p)
+                new += 1
+        if verbose:
+            console.print(f"  [dim]{name}: {new} proxies[/dim]")
+        logger.info(f"Source '{name}': {new} new proxies")
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         console=console,
     ) as progress:
-        task = progress.add_task(
-            "[cyan]Fetching public proxies...[/cyan]",
-            total=len(SCRAPERS),
-        )
+        task = progress.add_task("[cyan]Fetching public proxies...[/cyan]", total=total)
 
-        for name, scraper in SCRAPERS:
+        for source in SOURCES:
+            progress.update(task, description=f"[cyan]Scraping: {source.name}[/cyan]")
+            found = []
+            for url in source.urls:
+                found.extend(_fetch_text_url(url, source.proto))
+            _add(found, source.name)
+            progress.advance(task)
+
+        for name, fetcher in _SPECIAL_SOURCES:
             progress.update(task, description=f"[cyan]Scraping: {name}[/cyan]")
-            try:
-                found = scraper()
-                new = 0
-                for p in found:
-                    key = (p.host, p.port)
-                    if key not in seen:
-                        seen.add(key)
-                        all_proxies.append(p)
-                        new += 1
-                if verbose:
-                    console.print(f"  [dim]{name}: {new} proxies[/dim]")
-            except Exception as e:
-                if verbose:
-                    console.print(f"  [red]{name}: error — {e}[/red]")
+            _add(fetcher(), name)
             progress.advance(task)
 
     console.print(
-        f"[green]{len(all_proxies)} unique proxies collected from {len(SCRAPERS)} sources.[/green]"
+        f"[green]{len(all_proxies)} unique proxies collected from {total} sources.[/green]"
     )
+    logger.info(f"Proxy fetch complete: {len(all_proxies)} unique proxies from {total} sources")
     return all_proxies
 
 
