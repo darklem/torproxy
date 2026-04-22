@@ -541,8 +541,49 @@ class ProxyChainServer:
         with self._lock:
             self._rotation_in_progress = False
 
-        # Announce new IP in background — give the new chain a moment to settle
+        # Announce new IP + re-run MITM check in background (not for mitm-triggered rotations
+        # to avoid infinite loop: mitm-detected → rotate → mitm-detected → …)
         threading.Thread(target=self._announce_new_ip, daemon=True).start()
+        if reason != "mitm-detected":
+            threading.Thread(target=self._mitm_check_post_rotate, daemon=True).start()
+
+    def _mitm_check_post_rotate(self):
+        """Run MITM checks after a proxy rotation. Rotates once more if FAIL detected."""
+        try:
+            from mitm_check import run_mitm_checks, Status
+            time.sleep(4)   # let chain settle before probing
+            proxy = self.exit_proxy
+            logger.info(f"MITM check after rotation: {proxy.address} ({proxy.country or '??'})")
+            results = run_mitm_checks(self.local_port)
+
+            has_fail = any(r.status == Status.FAIL for r in results)
+            has_warn = any(r.status == Status.WARN for r in results)
+            verdict = "fail" if has_fail else "warn" if has_warn else "pass"
+
+            self.set_mitm_result(verdict, [
+                {"name": r.name, "status": r.status.value, "detail": r.detail}
+                for r in results
+            ])
+            for r in results:
+                lvl = logger.warning if r.status in (Status.FAIL, Status.WARN) else logger.info
+                lvl(f"MITM [{r.name}] {r.status.value.upper()} — {r.detail}")
+
+            if has_fail:
+                logger.warning(
+                    f"MITM DETECTED on new proxy {proxy.address} — rotating again"
+                )
+                console.print(
+                    f"\n[red bold]⚠ MITM detected on new proxy {proxy.address} — rotating again[/red bold]"
+                )
+                self._auto_rotate("mitm-detected")
+            elif has_warn:
+                logger.warning(f"MITM warning on {proxy.address} after rotation — proceeding with caution")
+                console.print(f"[yellow]MITM warning on {proxy.address} — use with caution[/yellow]")
+            else:
+                logger.info(f"MITM check PASSED on {proxy.address} — proxy is clean")
+                console.print(f"[green]MITM check passed on new proxy {proxy.address}[/green]")
+        except Exception as e:
+            logger.debug(f"MITM post-rotate check error: {e}")
 
     def _on_chain_failure(self):
         """Called by _ClientHandler when a connection through the chain fails."""
