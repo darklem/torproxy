@@ -262,54 +262,55 @@ _log = logging.getLogger(__name__)
 def _run_mitm_and_react(server, local_port: int, alive_proxies: list, max_retries: int = 3):
     """
     Run MITM checks after chain mount. On FAIL, auto-rotate and retry up to
-    max_retries times. Logs a clear WARNING for any failed or warned check.
+    max_retries times. Logs every individual check result + global verdict.
+    Stores result in server for the web admin UI.
     """
     from mitm_check import run_mitm_checks, display_mitm_results, Status
 
     for attempt in range(1, max_retries + 1):
         console.print()
-        console.print(
-            f"[cyan]Running MITM detection "
-            f"({'attempt ' + str(attempt) + '/' + str(max_retries) if attempt > 1 else 'automatic at chain mount'})...[/cyan]"
-        )
+        label = "automatic at chain mount" if attempt == 1 else f"attempt {attempt}/{max_retries}"
+        console.print(f"[cyan]Running MITM detection ({label})...[/cyan]")
+
         results = run_mitm_checks(local_port)
         display_mitm_results(results)
 
+        # Log every individual check
+        for r in results:
+            lvl = _log.warning if r.status in (Status.FAIL, Status.WARN) else _log.info
+            lvl(f"MITM [{r.name}] {r.status.value.upper()} — {r.detail}")
+
         has_fail = any(r.status == Status.FAIL for r in results)
         has_warn = any(r.status == Status.WARN for r in results)
+        verdict = "fail" if has_fail else "warn" if has_warn else "pass"
+
+        # Push state to the server for the web UI
+        checks_payload = [
+            {"name": r.name, "status": r.status.value, "detail": r.detail}
+            for r in results
+        ]
+        server.set_mitm_result(verdict, checks_payload)
+
+        proxy_label = f"{server.exit_proxy.address} ({server.exit_proxy.country or '??'})"
 
         if has_fail:
-            _log.warning(
-                f"MITM DETECTED on proxy {server.exit_proxy.address} "
-                f"({server.exit_proxy.country or '??'}) — rotating to next proxy"
-            )
-            console.print(
-                f"[red bold]⚠ MITM DETECTED — rotating exit proxy automatically[/red bold]"
-            )
+            _log.warning(f"MITM DETECTED on {proxy_label} — rotating to next proxy")
+            console.print("[red bold]⚠ MITM DETECTED — rotating exit proxy automatically[/red bold]")
             if len(alive_proxies) > 1:
                 server.rotate()
-                time.sleep(3)   # let chain settle before re-checking
+                time.sleep(3)
             else:
-                console.print("[yellow]No alternative proxy in pool — cannot rotate.[/yellow]")
                 _log.warning("MITM detected but pool has only one proxy — cannot rotate")
+                console.print("[yellow]No alternative proxy in pool — cannot rotate.[/yellow]")
                 break
         elif has_warn:
-            _log.warning(
-                f"MITM warning on proxy {server.exit_proxy.address} "
-                f"({server.exit_proxy.country or '??'}) — proceeding with caution"
-            )
+            _log.warning(f"MITM warning on {proxy_label} — proceeding with caution")
             break
         else:
-            _log.info(
-                f"MITM check passed: proxy {server.exit_proxy.address} "
-                f"({server.exit_proxy.country or '??'}) is clean"
-            )
+            _log.info(f"MITM check PASSED on {proxy_label} — proxy is clean")
             break
     else:
-        _log.warning(
-            f"MITM check failed after {max_retries} attempts — "
-            "proxy chain may be compromised"
-        )
+        _log.warning(f"MITM check FAILED after {max_retries} attempts — chain may be compromised")
         console.print(
             f"[red bold]⚠ MITM still detected after {max_retries} proxy rotations. "
             "Use with caution.[/red bold]"

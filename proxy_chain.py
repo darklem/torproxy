@@ -293,6 +293,7 @@ tr:hover td{background:#1c2128}
 </style></head><body>
 <h1><span id="dot"></span>⛓️ TorProxy-Chain Admin</h1>
 <div id="status-card" class="card"></div>
+<div id="mitm-card" class="card"></div>
 <div class="card">
   <h2>Proxy Pool</h2>
   <div class="toolbar">
@@ -321,6 +322,19 @@ async function refresh(){
       <div class="stat"><div class="stat-label">Last rotation</div><div class="stat-value">${fmtTime(st.last_rotation)}</div></div>
       <div class="stat"><div class="stat-label">Reason</div><div class="stat-value">${st.last_rotation_reason||'—'}</div></div>
       <div class="stat"><div class="stat-label">Watchdog</div><div class="stat-value dim">every ${st.watchdog_interval_s}s</div></div>`;
+    const mv=st.mitm_verdict;
+    const mvcol=mv==='pass'?'green':mv==='warn'?'yellow':mv==='fail'?'red':'dim';
+    const mvlabel=mv==='unknown'?'not checked yet':mv.toUpperCase();
+    const checkRows=(st.mitm_checks||[]).map(c=>{
+      const col=c.status==='pass'?'green':c.status==='warn'?'yellow':'red';
+      return `<tr><td>${c.name}</td><td class="${col}">${c.status.toUpperCase()}</td><td class="dim">${c.detail||''}</td></tr>`;
+    }).join('');
+    document.getElementById('mitm-card').innerHTML=`
+      <h2>MITM Detection</h2>
+      <div class="stat"><div class="stat-label">Verdict</div><div class="stat-value ${mvcol}">${mvlabel}</div></div>
+      <div class="stat"><div class="stat-label">Last check</div><div class="stat-value">${fmtTime(st.mitm_last_check)}</div></div>
+      ${checkRows?`<br><br><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>${checkRows}</tbody></table>`:''}
+    `;
     const rows=pool.map(p=>`<tr class="${p.active?'active-row':''}">
       <td class="dim">${p.index}</td>
       <td class="${p.active?'green':''}">${p.address}</td>
@@ -386,6 +400,11 @@ class ProxyChainServer:
         self._connections_failed: int = 0
         self._last_rotation_time: Optional[datetime.datetime] = None
         self._last_rotation_reason: str = ""
+
+        # MITM state (updated by set_mitm_result)
+        self._mitm_verdict: str = "unknown"
+        self._mitm_last_check: Optional[datetime.datetime] = None
+        self._mitm_checks: List[dict] = []
 
         self._server_sock: Optional[socket.socket] = None
         self._running = False
@@ -571,6 +590,10 @@ class ProxyChainServer:
             failed = self._connections_failed
             last_rot = self._last_rotation_time
             last_reason = self._last_rotation_reason
+        with self._lock:
+            mitm_verdict = self._mitm_verdict
+            mitm_last = self._mitm_last_check
+            mitm_checks = list(self._mitm_checks)
         return {
             "active_proxy": proxy.address,
             "country": proxy.country or "??",
@@ -585,6 +608,9 @@ class ProxyChainServer:
             "uptime_s": uptime,
             "connections_accepted": accepted,
             "connections_failed": failed,
+            "mitm_verdict": mitm_verdict,
+            "mitm_last_check": mitm_last.isoformat() + "Z" if mitm_last else None,
+            "mitm_checks": mitm_checks,
         }
 
     def _get_pool(self) -> list:
@@ -666,6 +692,13 @@ class ProxyChainServer:
             logger.warning(f"Admin server error: {e}")
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_mitm_result(self, verdict: str, checks: List[dict]):
+        """Store the latest MITM check result (called from main after each check run)."""
+        with self._lock:
+            self._mitm_verdict = verdict
+            self._mitm_last_check = datetime.datetime.utcnow()
+            self._mitm_checks = checks
 
     def swap_exit_proxy(self, new_proxy: Proxy):
         """Hot-swap the exit proxy without restarting the server."""
