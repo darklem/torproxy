@@ -508,15 +508,23 @@ def run(
 
     write_pid(os.getpid(), local_port, selected_country or "ALL")
 
-    console.print("[cyan]Verifying final public IP...[/cyan]")
-    time.sleep(2)
-    ip_info = get_chained_ip(local_port=local_port)
+    console.print("[cyan]Verifying chain (this may take a few seconds)...[/cyan]")
+    ip_info = None
+    for attempt in range(1, 4):   # up to 3 attempts with increasing delay
+        time.sleep(attempt * 3)
+        ip_info = get_chained_ip(local_port=local_port)
+        if ip_info:
+            break
+        console.print(f"[dim]  Attempt {attempt}/3 — chain not ready yet, retrying...[/dim]")
+        if attempt < 3 and len(alive_proxies) > 1:
+            server.rotate()   # try next proxy if current one is unresponsive
 
     if ip_info:
-        display_chain_status(active_proxy, local_port, ip_info)
+        display_chain_status(server.exit_proxy, local_port, ip_info)
     else:
-        console.print("[yellow]Could not verify final IP (proxy may be slow).[/yellow]")
+        console.print("[yellow]Could not verify chain IP after 3 attempts.[/yellow]")
         console.print(f"[cyan]SOCKS5 server is active at socks5://127.0.0.1:{local_port}[/cyan]")
+        _log.warning("Chain IP verification failed after 3 attempts — proxy may be unresponsive")
 
     # ── MITM check (automatic at chain mount) ────────────────────────────────
     if not skip_mitm_check:
