@@ -256,6 +256,66 @@ def _run_scan_mitm(tor_port_arg: Optional[int], limit: int):
     tor.stop()
 
 
+_log = logging.getLogger(__name__)
+
+
+def _run_mitm_and_react(server, local_port: int, alive_proxies: list, max_retries: int = 3):
+    """
+    Run MITM checks after chain mount. On FAIL, auto-rotate and retry up to
+    max_retries times. Logs a clear WARNING for any failed or warned check.
+    """
+    from mitm_check import run_mitm_checks, display_mitm_results, Status
+
+    for attempt in range(1, max_retries + 1):
+        console.print()
+        console.print(
+            f"[cyan]Running MITM detection "
+            f"({'attempt ' + str(attempt) + '/' + str(max_retries) if attempt > 1 else 'automatic at chain mount'})...[/cyan]"
+        )
+        results = run_mitm_checks(local_port)
+        display_mitm_results(results)
+
+        has_fail = any(r.status == Status.FAIL for r in results)
+        has_warn = any(r.status == Status.WARN for r in results)
+
+        if has_fail:
+            _log.warning(
+                f"MITM DETECTED on proxy {server.exit_proxy.address} "
+                f"({server.exit_proxy.country or '??'}) — rotating to next proxy"
+            )
+            console.print(
+                f"[red bold]⚠ MITM DETECTED — rotating exit proxy automatically[/red bold]"
+            )
+            if len(alive_proxies) > 1:
+                server.rotate()
+                time.sleep(3)   # let chain settle before re-checking
+            else:
+                console.print("[yellow]No alternative proxy in pool — cannot rotate.[/yellow]")
+                _log.warning("MITM detected but pool has only one proxy — cannot rotate")
+                break
+        elif has_warn:
+            _log.warning(
+                f"MITM warning on proxy {server.exit_proxy.address} "
+                f"({server.exit_proxy.country or '??'}) — proceeding with caution"
+            )
+            break
+        else:
+            _log.info(
+                f"MITM check passed: proxy {server.exit_proxy.address} "
+                f"({server.exit_proxy.country or '??'}) is clean"
+            )
+            break
+    else:
+        _log.warning(
+            f"MITM check failed after {max_retries} attempts — "
+            "proxy chain may be compromised"
+        )
+        console.print(
+            f"[red bold]⚠ MITM still detected after {max_retries} proxy rotations. "
+            "Use with caution.[/red bold]"
+        )
+
+
 def run(
     country_arg: str,
     local_port: int,
@@ -460,10 +520,7 @@ def run(
 
     # ── MITM check (automatic at chain mount) ────────────────────────────────
     if not skip_mitm_check:
-        console.print()
-        console.print("[cyan]Running MITM detection...[/cyan]")
-        results = run_mitm_checks(local_port)
-        display_mitm_results(results)
+        _run_mitm_and_react(server, local_port, alive_proxies)
 
     # ── Headless mode — block until signal ───────────────────────────────────
     if headless:

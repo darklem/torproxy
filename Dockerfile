@@ -19,7 +19,6 @@ VOLUME ["/root/.torproxy-chain"]
 
 # Auto-envvar prefix: TORPROXY_COUNTRY=FR maps to --country FR, etc.
 ENV TORPROXY_HEADLESS=1 \
-    TORPROXY_SKIP_MITM_CHECK=1 \
     TORPROXY_STATUS_PORT=10801
 
 ENTRYPOINT ["python", "main.py"]
