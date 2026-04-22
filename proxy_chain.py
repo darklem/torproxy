@@ -261,6 +261,86 @@ class _ClientHandler(threading.Thread):
             raise ConnectionError(f"SOCKS4 CONNECT failed: code=0x{resp[1]:02x}")
 
 
+# ── Admin UI HTML ─────────────────────────────────────────────────────────────
+
+_ADMIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>TorProxy-Chain Admin</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:monospace;padding:24px}
+h1{color:#58a6ff;margin-bottom:24px;font-size:1.4rem}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin-bottom:20px}
+.card h2{color:#8b949e;font-size:.75rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px}
+.stat{display:inline-block;margin-right:24px;margin-bottom:10px;vertical-align:top}
+.stat-label{color:#8b949e;font-size:.7rem;margin-bottom:2px}
+.stat-value{font-size:1rem;font-weight:bold}
+.green{color:#3fb950}.yellow{color:#d29922}.red{color:#f85149}.blue{color:#58a6ff}.dim{color:#8b949e}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{color:#8b949e;text-align:left;padding:8px 10px;border-bottom:1px solid #30363d;font-weight:normal}
+td{padding:7px 10px;border-bottom:1px solid #21262d}
+tr.active-row td{background:#1a2e1a}
+tr:hover td{background:#1c2128}
+.btn{border:none;border-radius:6px;padding:7px 16px;cursor:pointer;font-family:monospace;font-size:.85rem}
+.btn-blue{background:#1f6feb;color:#fff}.btn-blue:hover{background:#388bfd}
+.btn-green{background:#238636;color:#fff}.btn-green:hover{background:#2ea043}
+.btn-ghost{background:#21262d;color:#8b949e;border:1px solid #30363d}.btn-ghost:hover{background:#30363d;color:#e6edf3}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72rem}
+.badge-active{background:#1a4731;color:#3fb950}
+#dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:6px;vertical-align:middle}
+.toolbar{margin-bottom:16px}
+</style></head><body>
+<h1><span id="dot"></span>⛓️ TorProxy-Chain Admin</h1>
+<div id="status-card" class="card"></div>
+<div class="card">
+  <h2>Proxy Pool</h2>
+  <div class="toolbar">
+    <button class="btn btn-blue" onclick="rotate()">↻ Rotate</button>
+  </div>
+  <div id="pool-table"></div>
+</div>
+<script>
+function fmtUptime(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;return(h?h+'h ':'')+m+'m '+sec+'s'}
+function fmtTime(iso){return iso?new Date(iso).toLocaleTimeString():'—'}
+async function refresh(){
+  try{
+    const[st,pool]=await Promise.all([fetch('/status').then(r=>r.json()),fetch('/pool').then(r=>r.json())]);
+    document.getElementById('status-card').innerHTML=`
+      <h2>Current Proxy</h2>
+      <div class="stat"><div class="stat-label">Address</div><div class="stat-value blue">${st.active_proxy}</div></div>
+      <div class="stat"><div class="stat-label">Country</div><div class="stat-value">${st.country}</div></div>
+      <div class="stat"><div class="stat-label">Protocol</div><div class="stat-value">${st.proto}</div></div>
+      <div class="stat"><div class="stat-label">Pool position</div><div class="stat-value">${st.pool_index+1} / ${st.pool_size}</div></div>
+      <br><br>
+      <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value">${fmtUptime(st.uptime_s)}</div></div>
+      <div class="stat"><div class="stat-label">Connections</div><div class="stat-value green">${st.connections_accepted}</div></div>
+      <div class="stat"><div class="stat-label">Conn. failures</div><div class="stat-value ${st.connections_failed>0?'red':'green'}">${st.connections_failed}</div></div>
+      <div class="stat"><div class="stat-label">Failure count</div><div class="stat-value ${st.failure_count>0?'yellow':'green'}">${st.failure_count} / ${st.fail_threshold}</div></div>
+      <br><br>
+      <div class="stat"><div class="stat-label">Last rotation</div><div class="stat-value">${fmtTime(st.last_rotation)}</div></div>
+      <div class="stat"><div class="stat-label">Reason</div><div class="stat-value">${st.last_rotation_reason||'—'}</div></div>
+      <div class="stat"><div class="stat-label">Watchdog</div><div class="stat-value dim">every ${st.watchdog_interval_s}s</div></div>`;
+    const rows=pool.map(p=>`<tr class="${p.active?'active-row':''}">
+      <td class="dim">${p.index}</td>
+      <td class="${p.active?'green':''}">${p.address}</td>
+      <td>${p.country}</td>
+      <td class="dim">${p.proto}</td>
+      <td class="dim">${p.latency_ms>0?p.latency_ms.toFixed(0)+'ms':'—'}</td>
+      <td>${p.active?'<span class="badge badge-active">active</span>':''}</td>
+      <td>${p.active?'':'<button class="btn btn-ghost" onclick="useProxy('+p.index+')">Use</button>'}</td>
+    </tr>`).join('');
+    document.getElementById('pool-table').innerHTML=`<table>
+      <thead><tr><th>#</th><th>Address</th><th>Country</th><th>Proto</th><th>Latency</th><th></th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }catch(e){document.getElementById('dot').style.background='#f85149'}
+}
+async function rotate(){await fetch('/rotate',{method:'POST'});setTimeout(refresh,800)}
+async function useProxy(n){await fetch('/proxy/'+n,{method:'POST'});setTimeout(refresh,400)}
+refresh();setInterval(refresh,5000);
+</script></body></html>"""
+
+
 # ── Local SOCKS5 server ───────────────────────────────────────────────────────
 
 class ProxyChainServer:
@@ -442,6 +522,9 @@ class ProxyChainServer:
         with self._lock:
             self._rotation_in_progress = False
 
+        # Announce new IP in background — give the new chain a moment to settle
+        threading.Thread(target=self._announce_new_ip, daemon=True).start()
+
     def _on_chain_failure(self):
         """Called by _ClientHandler when a connection through the chain fails."""
         with self._lock:
@@ -459,22 +542,22 @@ class ProxyChainServer:
             "\n[red bold]Rate-limit redirect detected. Rotating exit proxy...[/red bold]"
         )
         self._auto_rotate("rate-limit")
-        threading.Thread(target=self._announce_new_ip, daemon=True).start()
 
     def _announce_new_ip(self):
-        """Fetch and display the new public IP after rotation."""
+        """Fetch and display the new public IP after rotation (called after settle delay)."""
+        time.sleep(4)   # let the new chain establish before probing
         ip_info = get_chained_ip(self.local_port)
-        if ip_info:
-            logger.info(f"New exit IP after rotation: {ip_info['ip']} ({ip_info['country']})")
+        if ip_info and ip_info.get("ip") not in (None, "", "?"):
+            logger.info(f"New exit IP: {ip_info['ip']} ({ip_info['country']})")
             console.print(
                 f"[green]New exit IP: [bold]{ip_info['ip']}[/bold] | "
                 f"{ip_info['country']} | {ip_info['city']} | {ip_info['org']}[/green]"
             )
         else:
-            logger.warning("Could not verify new IP after rotation")
+            logger.warning("Could not verify new IP after rotation (proxy may be slow)")
             console.print("[yellow]Could not verify new IP after rotation.[/yellow]")
 
-    # ── Status HTTP server ────────────────────────────────────────────────────
+    # ── Admin HTTP server ─────────────────────────────────────────────────────
 
     def _get_status(self) -> dict:
         now = datetime.datetime.utcnow()
@@ -504,18 +587,69 @@ class ProxyChainServer:
             "connections_failed": failed,
         }
 
+    def _get_pool(self) -> list:
+        with self._lock:
+            pool = list(self._proxy_pool)
+            active_idx = self._proxy_index
+        return [
+            {
+                "index": i,
+                "address": p.address,
+                "country": p.country or "??",
+                "proto": p.proto,
+                "latency_ms": p.latency_ms,
+                "active": i == active_idx,
+            }
+            for i, p in enumerate(pool)
+        ]
+
     def _status_server_loop(self):
         server_ref = self
+        _HTML = _ADMIN_HTML  # module-level constant
 
         class _Handler(BaseHTTPRequestHandler):
+            def _send_json(self, data, status=200):
+                body = json.dumps(data, indent=2).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
-                if self.path == "/status":
-                    body = json.dumps(server_ref._get_status(), indent=2).encode()
+                if self.path in ("/", "/index.html"):
+                    body = _HTML.encode()
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                elif self.path == "/status":
+                    self._send_json(server_ref._get_status())
+                elif self.path == "/pool":
+                    self._send_json(server_ref._get_pool())
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                if self.path == "/rotate":
+                    server_ref.rotate()
+                    self._send_json({"ok": True, "proxy": server_ref.exit_proxy.address})
+                elif self.path.startswith("/proxy/"):
+                    try:
+                        idx = int(self.path.split("/proxy/")[1])
+                        with server_ref._lock:
+                            pool = server_ref._proxy_pool
+                        if 0 <= idx < len(pool):
+                            server_ref.swap_exit_proxy(pool[idx])
+                            with server_ref._lock:
+                                server_ref._proxy_index = idx
+                            self._send_json({"ok": True, "proxy": pool[idx].address})
+                        else:
+                            self._send_json({"ok": False, "error": "index out of range"}, 400)
+                    except (ValueError, IndexError):
+                        self._send_json({"ok": False, "error": "invalid index"}, 400)
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -529,7 +663,7 @@ class ProxyChainServer:
             while self._running:
                 httpd.handle_request()
         except Exception as e:
-            logger.warning(f"Status server error: {e}")
+            logger.warning(f"Admin server error: {e}")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
