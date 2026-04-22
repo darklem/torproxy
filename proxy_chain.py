@@ -14,7 +14,7 @@ import select
 import time
 import struct
 import logging
-from typing import Optional, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 import socks  # PySocks
 
@@ -95,13 +95,50 @@ def _socks5_reply_error(client_sock: socket.socket, code: int = 0x04):
         pass
 
 
+# ── Rate-limit detection ──────────────────────────────────────────────────────
+
+def _is_rate_limited(data: bytes) -> bool:
+    """Detect HTTP 429 or quota-related 403 in the first chunk of a response."""
+    if not data.startswith((b"HTTP/1", b"HTTP/2")):
+        return False
+    first_line = data.split(b"\n", 1)[0]
+    if b" 429 " in first_line:
+        return True
+    if b" 403 " in first_line:
+        low = data[:500].lower()
+        return b"quota" in low or b"rate" in low
+    return False
+
+
 # ── Bidirectional relay ───────────────────────────────────────────────────────
 
-def _relay(sock_a: socket.socket, sock_b: socket.socket, timeout: int = 60):
-    """Relay data between two sockets in both directions."""
+def _relay(
+    sock_a: socket.socket,
+    sock_b: socket.socket,
+    timeout: int = 60,
+    target_host: str = "",
+    watch_hosts: Optional[Set[str]] = None,
+    on_rate_limit: Optional[Callable] = None,
+):
+    """Relay data between two sockets in both directions.
+
+    If target_host is in watch_hosts, peeks at the first chunk from sock_b
+    to detect HTTP 429 / rate-limit responses before forwarding.
+    """
     sock_a.settimeout(timeout)
     sock_b.settimeout(timeout)
     try:
+        # Peek at first server chunk for watched hosts
+        if watch_hosts and target_host in watch_hosts and on_rate_limit:
+            try:
+                first = sock_b.recv(4096)
+                if first:
+                    if _is_rate_limited(first):
+                        threading.Thread(target=on_rate_limit, daemon=True).start()
+                    sock_a.sendall(first)
+            except Exception:
+                return
+
         while True:
             try:
                 readable, _, exceptional = select.select(
@@ -129,11 +166,22 @@ def _relay(sock_a: socket.socket, sock_b: socket.socket, timeout: int = 60):
 class _ClientHandler(threading.Thread):
     """Thread that handles a single client connection through the proxy chain."""
 
-    def __init__(self, client_sock: socket.socket, tor_port: int, exit_proxy: Proxy):
+    def __init__(
+        self,
+        client_sock: socket.socket,
+        tor_port: int,
+        exit_proxy: Proxy,
+        on_chain_failure: Optional[Callable] = None,
+        watch_hosts: Optional[Set[str]] = None,
+        on_rate_limit: Optional[Callable] = None,
+    ):
         super().__init__(daemon=True)
         self.client_sock = client_sock
         self.tor_port = tor_port
         self.exit_proxy = exit_proxy
+        self.on_chain_failure = on_chain_failure
+        self.watch_hosts = watch_hosts
+        self.on_rate_limit = on_rate_limit
 
     def run(self):
         remote_sock = None
@@ -146,10 +194,18 @@ class _ClientHandler(threading.Thread):
             remote_sock = self._connect_chain(target_host, target_port)
             if remote_sock is None:
                 _socks5_reply_error(self.client_sock, 0x04)
+                if self.on_chain_failure:
+                    self.on_chain_failure()
                 return
 
             _socks5_reply_success(self.client_sock)
-            _relay(self.client_sock, remote_sock)
+            _relay(
+                self.client_sock,
+                remote_sock,
+                target_host=target_host,
+                watch_hosts=self.watch_hosts,
+                on_rate_limit=self.on_rate_limit,
+            )
 
         except Exception as e:
             logger.debug(f"ClientHandler error: {e}")
@@ -239,6 +295,8 @@ class ProxyChainServer:
     """
     Local SOCKS5 server that chains connections:
         Client → Server (local) → Tor → Exit SOCKS proxy → Internet
+
+    Supports automatic proxy rotation via a watchdog thread and HTTP 429 detection.
     """
 
     def __init__(
@@ -247,17 +305,34 @@ class ProxyChainServer:
         tor_port: int = 9050,
         local_port: int = DEFAULT_LOCAL_PORT,
         local_host: str = LOCAL_BIND,
+        proxy_pool: Optional[List[Proxy]] = None,
+        watchdog_interval: int = 30,
+        fail_threshold: int = 3,
+        watch_hosts: Optional[Set[str]] = None,
     ):
         self.exit_proxy = exit_proxy
         self.tor_port = tor_port
         self.local_port = local_port
         self.local_host = local_host
+        self._watch_hosts = watch_hosts
+
+        # Proxy pool for auto-rotation
+        self._proxy_pool: List[Proxy] = proxy_pool if proxy_pool else [exit_proxy]
+        self._proxy_index: int = 0
+        self._failure_count: int = 0
+        self._watchdog_interval = watchdog_interval
+        self._fail_threshold = fail_threshold
+
+        self._lock = threading.Lock()
+        self._rotation_in_progress = False
+
         self._server_sock: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
 
     def start(self) -> bool:
-        """Start the local SOCKS5 server in a background thread."""
+        """Start the local SOCKS5 server and watchdog in background threads."""
         try:
             self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -266,6 +341,8 @@ class ProxyChainServer:
             self._running = True
             self._thread = threading.Thread(target=self._accept_loop, daemon=True)
             self._thread.start()
+            self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+            self._watchdog_thread.start()
             console.print(
                 f"[green]Local SOCKS5 server ready: "
                 f"[bold]socks5://{self.local_host}:{self.local_port}[/bold][/green]"
@@ -284,6 +361,9 @@ class ProxyChainServer:
                     client_sock=client_sock,
                     tor_port=self.tor_port,
                     exit_proxy=self.exit_proxy,
+                    on_chain_failure=self._on_chain_failure,
+                    watch_hosts=self._watch_hosts,
+                    on_rate_limit=self._on_rate_limit,
                 ).start()
             except socket.timeout:
                 continue
@@ -292,13 +372,110 @@ class ProxyChainServer:
                     logger.debug(f"Accept error: {e}")
                 break
 
+    # ── Watchdog ──────────────────────────────────────────────────────────────
+
+    def _probe_proxy(self, proxy: Proxy) -> bool:
+        """TCP probe through Tor to verify the exit proxy is reachable."""
+        try:
+            s = socks.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+            s.set_proxy(socks.SOCKS5, "127.0.0.1", self.tor_port, rdns=True)
+            s.settimeout(10)
+            s.connect((proxy.host, proxy.port))
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    def _watchdog_loop(self):
+        elapsed = 0
+        while self._running:
+            time.sleep(1)
+            elapsed += 1
+            if elapsed < self._watchdog_interval:
+                continue
+            elapsed = 0
+
+            proxy = self.exit_proxy
+            ok = self._probe_proxy(proxy)
+            if ok:
+                with self._lock:
+                    self._failure_count = 0
+            else:
+                with self._lock:
+                    self._failure_count += 1
+                    count = self._failure_count
+                logger.debug(f"Watchdog: probe failed ({count}/{self._fail_threshold})")
+                if count >= self._fail_threshold:
+                    self._auto_rotate("watchdog")
+
+    # ── Auto-rotation ─────────────────────────────────────────────────────────
+
+    def _auto_rotate(self, reason: str):
+        """Rotate to the next proxy in the pool (thread-safe, debounced)."""
+        with self._lock:
+            if self._rotation_in_progress:
+                return
+            if len(self._proxy_pool) <= 1:
+                logger.debug("Auto-rotate: pool has only one proxy, skipping")
+                return
+            self._rotation_in_progress = True
+            self._proxy_index = (self._proxy_index + 1) % len(self._proxy_pool)
+            new_proxy = self._proxy_pool[self._proxy_index]
+            self.exit_proxy = new_proxy
+            self._failure_count = 0
+
+        console.print(
+            f"\n[yellow bold]Auto-rotation ({reason}) → "
+            f"[cyan]{new_proxy.address}[/cyan] "
+            f"({new_proxy.country or '??'})[/yellow bold]"
+        )
+
+        with self._lock:
+            self._rotation_in_progress = False
+
+    def _on_chain_failure(self):
+        """Called by _ClientHandler when a connection through the chain fails."""
+        with self._lock:
+            self._failure_count += 1
+            count = self._failure_count
+        if count >= self._fail_threshold:
+            self._auto_rotate("chain-failure")
+
+    def _on_rate_limit(self):
+        """Called when HTTP 429 / quota exhaustion is detected on a watched host."""
+        console.print(
+            "\n[red bold]Rate-limit detected (HTTP 429 / quota). Rotating exit proxy...[/red bold]"
+        )
+        self._auto_rotate("rate-limit")
+        threading.Thread(target=self._announce_new_ip, daemon=True).start()
+
+    def _announce_new_ip(self):
+        """Fetch and display the new public IP after a rate-limit rotation."""
+        ip_info = get_chained_ip(self.local_port)
+        if ip_info:
+            console.print(
+                f"[green]New exit IP: [bold]{ip_info['ip']}[/bold] | "
+                f"{ip_info['country']} | {ip_info['city']} | {ip_info['org']}[/green]"
+            )
+        else:
+            console.print("[yellow]Could not verify new IP after rotation.[/yellow]")
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def swap_exit_proxy(self, new_proxy: Proxy):
         """Hot-swap the exit proxy without restarting the server."""
-        self.exit_proxy = new_proxy
+        with self._lock:
+            self.exit_proxy = new_proxy
+            self._failure_count = 0
         console.print(
             f"[cyan]Exit proxy swapped → [bold]{new_proxy.address}[/bold] "
             f"({new_proxy.country or '??'})[/cyan]"
         )
+
+    def rotate(self) -> Proxy:
+        """Manually rotate to the next proxy in the pool. Returns the new proxy."""
+        self._auto_rotate("manual")
+        return self.exit_proxy
 
     def stop(self):
         self._running = False
@@ -309,6 +486,8 @@ class ProxyChainServer:
                 pass
         if self._thread:
             self._thread.join(timeout=3)
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=3)
 
     def __enter__(self):
         self.start()

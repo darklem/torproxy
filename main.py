@@ -20,7 +20,7 @@ import sys
 import time
 import signal
 import os
-from typing import Optional
+from typing import List, Optional, Set
 import click
 from pathlib import Path
 
@@ -58,6 +58,8 @@ from mitm_check import (
 )
 
 console = Console()
+
+DEFAULT_WATCH_HOSTS = {"censys.io", "api.censys.io", "shodan.io", "api.shodan.io"}
 
 BANNER = """[bold cyan]
   ████████╗ ██████╗ ██████╗    ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
@@ -251,6 +253,9 @@ def run(
     skip_verify: bool,
     tor_port_arg: int = None,
     skip_mitm_check: bool = False,
+    watchdog_interval: int = 30,
+    fail_threshold: int = 3,
+    rate_limit_hosts: Optional[str] = None,
 ):
     console.print(BANNER)
     console.print()
@@ -402,10 +407,18 @@ def run(
     console.print()
 
     # ── Start chain server ────────────────────────────────────────────────────
+    extra_hosts: Set[str] = set()
+    if rate_limit_hosts:
+        extra_hosts = {h.strip() for h in rate_limit_hosts.split(",") if h.strip()}
+
     server = ProxyChainServer(
         exit_proxy=active_proxy,
         tor_port=active_tor_port,
         local_port=local_port,
+        proxy_pool=alive_proxies,
+        watchdog_interval=watchdog_interval,
+        fail_threshold=fail_threshold,
+        watch_hosts=DEFAULT_WATCH_HOSTS | extra_hosts,
     )
     if not server.start():
         tor.stop()
@@ -431,8 +444,6 @@ def run(
         display_mitm_results(results)
 
     # ── Interactive loop ──────────────────────────────────────────────────────
-    proxy_index = 0
-
     console.print()
     console.print(Panel(
         "[bold]Controls:[/bold]\n\n"
@@ -487,9 +498,7 @@ def run(
             break
 
         elif cmd == "r":
-            proxy_index = (proxy_index + 1) % len(alive_proxies)
-            new_proxy = alive_proxies[proxy_index]
-            server.swap_exit_proxy(new_proxy)
+            new_proxy = server.rotate()
             console.print(
                 f"[cyan]Rotated → {flag(new_proxy.country)} {new_proxy.address} "
                 f"({new_proxy.latency_ms:.0f} ms)[/cyan]"
@@ -547,9 +556,12 @@ def run(
 @click.option("--skip-mitm-check",      is_flag=True, default=False,                 help="Skip automatic MITM detection after chain setup.")
 @click.option("--scan-mitm",            is_flag=True, default=False,                 help="Scan all proxies in the cache for MITM and show a report.")
 @click.option("--scan-limit",           default=200,  show_default=True, type=int,   help="Max number of proxies to test during --scan-mitm.")
-@click.option("--kill",           "-k", is_flag=True, default=False,                 help="Stop a detached TorProxy-Chain server.")
-@click.option("--clear-cache",          is_flag=True, default=False,                 help="Clear the proxy geolocation SQLite cache.")
-def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache):
+@click.option("--kill",             "-k", is_flag=True, default=False,                   help="Stop a detached TorProxy-Chain server.")
+@click.option("--clear-cache",            is_flag=True, default=False,                   help="Clear the proxy geolocation SQLite cache.")
+@click.option("--watchdog-interval",      default=30,   show_default=True, type=int,     help="Watchdog probe interval in seconds.")
+@click.option("--fail-threshold",         default=3,    show_default=True, type=int,     help="Consecutive failures before auto-rotation.")
+@click.option("--rate-limit-hosts",       default="",                                    help="Extra hosts to watch for HTTP 429 (comma-separated).")
+def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts):
     if kill:
         info = read_pid()
         if not info:
@@ -589,6 +601,9 @@ def main(country, list_countries, local_port, tor_port, verbose, skip_verify, sk
         skip_verify=skip_verify,
         tor_port_arg=tor_port,
         skip_mitm_check=skip_mitm_check,
+        watchdog_interval=watchdog_interval,
+        fail_threshold=fail_threshold,
+        rate_limit_hosts=rate_limit_hosts or None,
     )
 
 
