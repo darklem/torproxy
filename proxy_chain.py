@@ -95,50 +95,13 @@ def _socks5_reply_error(client_sock: socket.socket, code: int = 0x04):
         pass
 
 
-# ── Rate-limit detection ──────────────────────────────────────────────────────
-
-def _is_rate_limited(data: bytes) -> bool:
-    """Detect HTTP 429 or quota-related 403 in the first chunk of a response."""
-    if not data.startswith((b"HTTP/1", b"HTTP/2")):
-        return False
-    first_line = data.split(b"\n", 1)[0]
-    if b" 429 " in first_line:
-        return True
-    if b" 403 " in first_line:
-        low = data[:500].lower()
-        return b"quota" in low or b"rate" in low
-    return False
-
-
 # ── Bidirectional relay ───────────────────────────────────────────────────────
 
-def _relay(
-    sock_a: socket.socket,
-    sock_b: socket.socket,
-    timeout: int = 60,
-    target_host: str = "",
-    watch_hosts: Optional[Set[str]] = None,
-    on_rate_limit: Optional[Callable] = None,
-):
-    """Relay data between two sockets in both directions.
-
-    If target_host is in watch_hosts, peeks at the first chunk from sock_b
-    to detect HTTP 429 / rate-limit responses before forwarding.
-    """
+def _relay(sock_a: socket.socket, sock_b: socket.socket, timeout: int = 60):
+    """Relay data between two sockets in both directions."""
     sock_a.settimeout(timeout)
     sock_b.settimeout(timeout)
     try:
-        # Peek at first server chunk for watched hosts
-        if watch_hosts and target_host in watch_hosts and on_rate_limit:
-            try:
-                first = sock_b.recv(4096)
-                if first:
-                    if _is_rate_limited(first):
-                        threading.Thread(target=on_rate_limit, daemon=True).start()
-                    sock_a.sendall(first)
-            except Exception:
-                return
-
         while True:
             try:
                 readable, _, exceptional = select.select(
@@ -172,7 +135,7 @@ class _ClientHandler(threading.Thread):
         tor_port: int,
         exit_proxy: Proxy,
         on_chain_failure: Optional[Callable] = None,
-        watch_hosts: Optional[Set[str]] = None,
+        trigger_hosts: Optional[Set[str]] = None,
         on_rate_limit: Optional[Callable] = None,
     ):
         super().__init__(daemon=True)
@@ -180,7 +143,7 @@ class _ClientHandler(threading.Thread):
         self.tor_port = tor_port
         self.exit_proxy = exit_proxy
         self.on_chain_failure = on_chain_failure
-        self.watch_hosts = watch_hosts
+        self.trigger_hosts = trigger_hosts
         self.on_rate_limit = on_rate_limit
 
     def run(self):
@@ -191,6 +154,12 @@ class _ClientHandler(threading.Thread):
                 return
             target_host, target_port = result
 
+            # Redirect-based rate-limit detection: the SOCKS5 CONNECT hostname
+            # is always in plaintext, even for HTTPS. If the browser was redirected
+            # to a known rate-limit page (e.g. accounts.censys.io), we see it here.
+            if self.trigger_hosts and target_host in self.trigger_hosts and self.on_rate_limit:
+                threading.Thread(target=self.on_rate_limit, daemon=True).start()
+
             remote_sock = self._connect_chain(target_host, target_port)
             if remote_sock is None:
                 _socks5_reply_error(self.client_sock, 0x04)
@@ -199,13 +168,7 @@ class _ClientHandler(threading.Thread):
                 return
 
             _socks5_reply_success(self.client_sock)
-            _relay(
-                self.client_sock,
-                remote_sock,
-                target_host=target_host,
-                watch_hosts=self.watch_hosts,
-                on_rate_limit=self.on_rate_limit,
-            )
+            _relay(self.client_sock, remote_sock)
 
         except Exception as e:
             logger.debug(f"ClientHandler error: {e}")
@@ -308,13 +271,13 @@ class ProxyChainServer:
         proxy_pool: Optional[List[Proxy]] = None,
         watchdog_interval: int = 30,
         fail_threshold: int = 3,
-        watch_hosts: Optional[Set[str]] = None,
+        trigger_hosts: Optional[Set[str]] = None,
     ):
         self.exit_proxy = exit_proxy
         self.tor_port = tor_port
         self.local_port = local_port
         self.local_host = local_host
-        self._watch_hosts = watch_hosts
+        self._trigger_hosts = trigger_hosts
 
         # Proxy pool for auto-rotation
         self._proxy_pool: List[Proxy] = proxy_pool if proxy_pool else [exit_proxy]
@@ -362,7 +325,7 @@ class ProxyChainServer:
                     tor_port=self.tor_port,
                     exit_proxy=self.exit_proxy,
                     on_chain_failure=self._on_chain_failure,
-                    watch_hosts=self._watch_hosts,
+                    trigger_hosts=self._trigger_hosts,
                     on_rate_limit=self._on_rate_limit,
                 ).start()
             except socket.timeout:

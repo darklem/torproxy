@@ -59,7 +59,7 @@ from mitm_check import (
 
 console = Console()
 
-DEFAULT_WATCH_HOSTS = {"censys.io", "api.censys.io", "shodan.io", "api.shodan.io"}
+DEFAULT_TRIGGER_HOSTS = {"accounts.censys.io"}
 
 BANNER = """[bold cyan]
   ████████╗ ██████╗ ██████╗    ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
@@ -418,7 +418,7 @@ def run(
         proxy_pool=alive_proxies,
         watchdog_interval=watchdog_interval,
         fail_threshold=fail_threshold,
-        watch_hosts=DEFAULT_WATCH_HOSTS | extra_hosts,
+        trigger_hosts=DEFAULT_TRIGGER_HOSTS | extra_hosts,
     )
     if not server.start():
         tor.stop()
@@ -560,7 +560,7 @@ def run(
 @click.option("--clear-cache",            is_flag=True, default=False,                   help="Clear the proxy geolocation SQLite cache.")
 @click.option("--watchdog-interval",      default=30,   show_default=True, type=int,     help="Watchdog probe interval in seconds.")
 @click.option("--fail-threshold",         default=3,    show_default=True, type=int,     help="Consecutive failures before auto-rotation.")
-@click.option("--rate-limit-hosts",       default="",                                    help="Extra hosts to watch for HTTP 429 (comma-separated).")
+@click.option("--rate-limit-hosts",       default="",                                    help="Extra redirect hostnames that trigger auto-rotation (comma-separated).")
 def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts):
     if kill:
         info = read_pid()
