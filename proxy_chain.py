@@ -22,6 +22,7 @@ from typing import Callable, List, Optional, Set, Tuple
 import socks  # PySocks
 
 from rich.console import Console
+from rich.panel import Panel
 from proxy_scraper import Proxy
 
 console = Console()
@@ -29,6 +30,42 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LOCAL_PORT = 10800
 LOCAL_BIND = "0.0.0.0"   # listen on all interfaces so LAN devices can use the proxy
+
+
+def show_mitm_alert(proxy_addr: str, checks: list):
+    """
+    Display a prominent Rich panel when MITM is detected.
+    checks: list of dicts {name, status, detail} — same format as set_mitm_result payload.
+    """
+    has_fail = any(c["status"] == "fail" for c in checks)
+    has_warn = any(c["status"] in ("fail", "warn") for c in checks)
+    if not has_warn:
+        return
+
+    icon = "⛔" if has_fail else "⚠"
+    title = (
+        f"{icon}  MITM DETECTED — PROXY IS INTERCEPTING YOUR TRAFFIC"
+        if has_fail else
+        f"{icon}  MITM WARNING — PROXY BEHAVIOUR IS SUSPICIOUS"
+    )
+    border = "red" if has_fail else "yellow"
+
+    lines = [f"[bold]Proxy:[/bold] [cyan]{proxy_addr}[/cyan]\n"]
+    status_colors = {"pass": "green", "warn": "yellow", "fail": "red",
+                     "error": "dim", "timeout": "dim"}
+    for c in checks:
+        color = status_colors.get(c["status"], "dim")
+        badge = f"[{color}][{c['status'].upper():7}][/{color}]"
+        lines.append(f"  {badge}  {c['name']}")
+        if c.get("detail"):
+            lines.append(f"             [dim]{c['detail']}[/dim]")
+
+    console.print(Panel(
+        "\n".join(lines),
+        title=f"[bold]{title}[/bold]",
+        border_style=border,
+        padding=(1, 2),
+    ))
 
 
 # ── Reliable recv ─────────────────────────────────────────────────────────────
@@ -560,28 +597,26 @@ class ProxyChainServer:
             has_warn = any(r.status == Status.WARN for r in results)
             verdict = "fail" if has_fail else "warn" if has_warn else "pass"
 
-            self.set_mitm_result(verdict, [
-                {"name": r.name, "status": r.status.value, "detail": r.detail}
-                for r in results
-            ])
             for r in results:
                 lvl = logger.warning if r.status in (Status.FAIL, Status.WARN) else logger.info
                 lvl(f"MITM [{r.name}] {r.status.value.upper()} — {r.detail}")
 
+            checks_payload = [
+                {"name": r.name, "status": r.status.value, "detail": r.detail}
+                for r in results
+            ]
+            self.set_mitm_result(verdict, checks_payload)
+            if has_fail or has_warn:
+                show_mitm_alert(proxy.address, checks_payload)
+
             if has_fail:
-                logger.warning(
-                    f"MITM DETECTED on new proxy {proxy.address} — rotating again"
-                )
-                console.print(
-                    f"\n[red bold]⚠ MITM detected on new proxy {proxy.address} — rotating again[/red bold]"
-                )
+                logger.warning(f"MITM DETECTED on {proxy.address} — rotating again")
                 self._auto_rotate("mitm-detected")
             elif has_warn:
-                logger.warning(f"MITM warning on {proxy.address} after rotation — proceeding with caution")
-                console.print(f"[yellow]MITM warning on {proxy.address} — use with caution[/yellow]")
+                logger.warning(f"MITM warning on {proxy.address} — proceeding with caution")
             else:
                 logger.info(f"MITM check PASSED on {proxy.address} — proxy is clean")
-                console.print(f"[green]MITM check passed on new proxy {proxy.address}[/green]")
+                console.print(f"[green]✓ MITM check passed — {proxy.address} is clean[/green]")
         except Exception as e:
             logger.debug(f"MITM post-rotate check error: {e}")
 

@@ -42,7 +42,7 @@ from proxy_scraper import (
     filter_by_country,
     Proxy,
 )
-from proxy_chain import ProxyChainServer, get_chained_ip, DEFAULT_LOCAL_PORT
+from proxy_chain import ProxyChainServer, get_chained_ip, DEFAULT_LOCAL_PORT, show_mitm_alert
 from proxy_cache import (
     load_cached_proxies,
     save_proxies_to_cache,
@@ -293,9 +293,11 @@ def _run_mitm_and_react(server, local_port: int, alive_proxies: list, max_retrie
 
         proxy_label = f"{server.exit_proxy.address} ({server.exit_proxy.country or '??'})"
 
+        if has_fail or has_warn:
+            show_mitm_alert(server.exit_proxy.address, checks_payload)
+
         if has_fail:
             _log.warning(f"MITM DETECTED on {proxy_label} — rotating to next proxy")
-            console.print("[red bold]⚠ MITM DETECTED — rotating exit proxy automatically[/red bold]")
             if len(alive_proxies) > 1:
                 server.rotate()
                 time.sleep(3)
@@ -308,6 +310,7 @@ def _run_mitm_and_react(server, local_port: int, alive_proxies: list, max_retrie
             break
         else:
             _log.info(f"MITM check PASSED on {proxy_label} — proxy is clean")
+            console.print(f"[green]✓ MITM check passed — {server.exit_proxy.address} is clean[/green]")
             break
     else:
         _log.warning(f"MITM check FAILED after {max_retries} attempts — chain may be compromised")
