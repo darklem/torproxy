@@ -256,6 +256,7 @@ def run(
     watchdog_interval: int = 30,
     fail_threshold: int = 3,
     rate_limit_hosts: Optional[str] = None,
+    headless: bool = False,
 ):
     console.print(BANNER)
     console.print()
@@ -351,13 +352,20 @@ def run(
         cc = country_arg.upper().strip()
         if cc not in countries:
             console.print(f"[yellow]Country '{cc}' not in current list.[/yellow]")
-            cc = select_country_interactive(countries, proxies_with_geo)
+            if headless:
+                console.print("[yellow]Headless mode: proceeding without country filter.[/yellow]")
+                cc = None
+            else:
+                cc = select_country_interactive(countries, proxies_with_geo)
         else:
             console.print(
                 f"[green]Country: {flag(cc)} [bold]{cc}[/bold] "
                 f"({countries[cc]} proxies available)[/green]"
             )
         selected_country = cc
+    elif headless:
+        console.print("[yellow]No country specified — using all available proxies.[/yellow]")
+        selected_country = None
     else:
         selected_country = select_country_interactive(countries, proxies_with_geo)
         console.print(f"[green]Country: {flag(selected_country)} [bold]{selected_country}[/bold][/green]")
@@ -442,6 +450,27 @@ def run(
         console.print("[cyan]Running MITM detection...[/cyan]")
         results = run_mitm_checks(local_port)
         display_mitm_results(results)
+
+    # ── Headless mode — block until signal ───────────────────────────────────
+    if headless:
+        console.print("[green]Headless mode active. Proxy running. Send SIGTERM to stop.[/green]")
+        def _headless_signal(sig, frame):
+            console.print("\n[yellow]Signal received, shutting down...[/yellow]")
+            server.stop()
+            tor.stop()
+            clear_pid()
+            sys.exit(0)
+        signal.signal(signal.SIGINT, _headless_signal)
+        signal.signal(signal.SIGTERM, _headless_signal)
+        try:
+            while True:
+                time.sleep(60)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        server.stop()
+        tor.stop()
+        clear_pid()
+        return
 
     # ── Interactive loop ──────────────────────────────────────────────────────
     console.print()
@@ -546,7 +575,7 @@ def run(
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-@click.command(help=__doc__)
+@click.command(help=__doc__, context_settings={"auto_envvar_prefix": "TORPROXY"})
 @click.option("--country",        "-c", default=None,               metavar="CODE",  help="ISO 2-letter exit country code (e.g. FR, US, DE). Interactive if omitted.")
 @click.option("--list-countries", "-l", is_flag=True, default=False,                 help="List available countries and exit.")
 @click.option("--local-port",     "-p", default=DEFAULT_LOCAL_PORT,  show_default=True, type=int, help="Local SOCKS5 server port.")
@@ -561,7 +590,8 @@ def run(
 @click.option("--watchdog-interval",      default=30,   show_default=True, type=int,     help="Watchdog probe interval in seconds.")
 @click.option("--fail-threshold",         default=3,    show_default=True, type=int,     help="Consecutive failures before auto-rotation.")
 @click.option("--rate-limit-hosts",       default="",                                    help="Extra redirect hostnames that trigger auto-rotation (comma-separated).")
-def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts):
+@click.option("--headless",               is_flag=True, default=False,                   help="Headless mode: no interactive prompts, block until SIGTERM.")
+def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts, headless):
     if kill:
         info = read_pid()
         if not info:
@@ -604,6 +634,7 @@ def main(country, list_countries, local_port, tor_port, verbose, skip_verify, sk
         watchdog_interval=watchdog_interval,
         fail_threshold=fail_threshold,
         rate_limit_hosts=rate_limit_hosts or None,
+        headless=headless,
     )
 
 

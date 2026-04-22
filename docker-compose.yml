@@ -1,0 +1,17 @@
+services:
+  torproxy:
+    build: .
+    ports:
+      - "10800:10800"
+    volumes:
+      - torproxy-cache:/root/.torproxy-chain
+    environment:
+      TORPROXY_HEADLESS: "1"
+      TORPROXY_SKIP_MITM_CHECK: "1"
+      # TORPROXY_COUNTRY: "FR"
+      # TORPROXY_WATCHDOG_INTERVAL: "30"
+      # TORPROXY_FAIL_THRESHOLD: "3"
+    restart: unless-stopped
+
+volumes:
+  torproxy-cache:
