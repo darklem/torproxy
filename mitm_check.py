@@ -1,14 +1,24 @@
 """
-MITM (man-in-the-middle) detection — active chain and bulk proxy scan.
+Bulk MITM scan for cached proxies  (--scan-mitm mode).
 
-Active-chain checks (run_mitm_checks):
-  1. TLS certificate fingerprint vs direct-connection baseline
-  2. HTTP header injection (Via, X-Forwarded-For, X-Cache, …)
-  3. SSL stripping — verify TLS handshake is not downgraded to plain HTTP
+MITM detection during normal operation is handled in proxy_scraper.py:
+_verify_via_chain() does a single HTTPS connection to ipconfig.io per proxy
+and compares the TLS certificate fingerprint against a direct baseline.
+Only proxies that pass are added to the active pool and the cache.
 
-Bulk scan (scan_all_proxies):
-  Runs checks 1 & 2 directly through Tor → each proxy, in parallel.
-  Displays a result table with per-proxy verdict and a MITM ratio summary.
+This module is only used by the --scan-mitm CLI flag, which runs a batch
+check of already-cached proxies to audit them independently.
+
+Each proxy is checked for:
+  1. TLS certificate fingerprint  (Tor → proxy → ipinfo.io / api.ipify.org)
+     Fingerprints are compared against a baseline fetched directly (no proxy).
+     A mismatch means the proxy is presenting a different certificate → MITM.
+
+  2. HTTP header injection  (Tor → proxy → httpbin.org/headers, plain HTTP)
+     httpbin echoes all request headers it received.  If proxy-related headers
+     (Via, X-Forwarded-For, …) appear, the proxy is injecting them.
+
+Results: PASS / WARN / FAIL per proxy, with a ratio summary at the end.
 """
 
 import ssl
@@ -19,10 +29,9 @@ import json
 import time
 import concurrent.futures
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 from enum import Enum
 
-import requests
 import socks as socks_mod
 from rich.console import Console
 from rich.panel import Panel
@@ -32,45 +41,44 @@ from rich import box
 
 console = Console()
 
-# ── Status & result types ─────────────────────────────────────────────────────
+# ── Status codes ──────────────────────────────────────────────────────────────
 
 class Status(Enum):
     PASS    = "pass"
-    WARN    = "warn"
-    FAIL    = "fail"
-    ERROR   = "error"
-    TIMEOUT = "timeout"
+    WARN    = "warn"     # suspicious but not conclusive
+    FAIL    = "fail"     # clear evidence of MITM
+    ERROR   = "error"    # could not complete the check
+    TIMEOUT = "timeout"  # proxy too slow to respond
 
 
-@dataclass
-class CheckResult:
-    name: str
-    status: Status
-    detail: str
-
+# ── Result types ──────────────────────────────────────────────────────────────
 
 @dataclass
 class ScanResult:
+    """Result of a full MITM scan on one proxy."""
     proxy_host: str
     proxy_port: int
     proxy_proto: str
     country: str
-    tls: Status
-    headers: Status
-    verdict: Status          # PASS / WARN / FAIL / ERROR / TIMEOUT
-    injected_headers: List[str]
+    tls: Status          # TLS certificate check
+    headers: Status      # HTTP header injection check
+    verdict: Status      # PASS / WARN / FAIL / ERROR / TIMEOUT
+    injected_headers: List[str]   # names of injected headers (if any)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+# Hosts used for TLS certificate comparison
 _BASELINE_ENDPOINTS = ["ipinfo.io", "api.ipify.org"]
 
+# Header names that indicate a transparent / injecting proxy
 _PROXY_HEADERS = {
     "via", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
     "x-real-ip", "forwarded", "proxy-connection", "x-cache", "x-cache-hits",
     "x-proxy-id", "x-bluecoat-via", "x-squid-error",
 }
 
+# httpbin echoes request headers as JSON — ideal for header injection detection
 _HEADER_HOST = "httpbin.org"
 _HEADER_PATH = "/headers"
 
@@ -78,6 +86,7 @@ _HEADER_PATH = "/headers"
 # ── Low-level socket helpers ──────────────────────────────────────────────────
 
 def _recvall_sock(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes, handling TCP fragmentation."""
     data = b""
     while len(data) < n:
         chunk = sock.recv(n - len(data))
@@ -88,8 +97,12 @@ def _recvall_sock(sock: socket.socket, n: int) -> bytes:
 
 
 def _socks5_tunnel(sock: socket.socket, host: str, port: int):
-    """Speak SOCKS5 (no-auth) to tunnel sock to host:port."""
-    sock.sendall(b"\x05\x01\x00")
+    """
+    Client-side SOCKS5 handshake over an already-open socket.
+    Asks the SOCKS5 server to tunnel us to host:port.
+    Raises ConnectionError on failure.
+    """
+    sock.sendall(b"\x05\x01\x00")   # offer no-auth only
     resp = _recvall_sock(sock, 2)
     if resp[1] != 0x00:
         raise ConnectionError(f"SOCKS5 auth rejected: {resp!r}")
@@ -102,19 +115,23 @@ def _socks5_tunnel(sock: socket.socket, host: str, port: int):
     hdr = _recvall_sock(sock, 4)
     if hdr[1] != 0x00:
         raise ConnectionError(f"SOCKS5 CONNECT failed: 0x{hdr[1]:02x}")
+    # Consume BND.ADDR + BND.PORT
     atyp = hdr[3]
-    if atyp == 0x01:   _recvall_sock(sock, 6)
-    elif atyp == 0x03: _recvall_sock(sock, _recvall_sock(sock, 1)[0] + 2)
-    elif atyp == 0x04: _recvall_sock(sock, 18)
+    if atyp == 0x01:    _recvall_sock(sock, 6)
+    elif atyp == 0x03:  _recvall_sock(sock, _recvall_sock(sock, 1)[0] + 2)
+    elif atyp == 0x04:  _recvall_sock(sock, 18)
 
 
 def _socks4_tunnel(sock: socket.socket, host: str, port: int):
-    """Speak SOCKS4a to tunnel sock to host:port."""
+    """
+    Client-side SOCKS4a handshake over an already-open socket.
+    Raises ConnectionError on failure.
+    """
     host_b = host.encode() + b"\x00"
     sock.sendall(
         b"\x04\x01"
         + struct.pack("!H", port)
-        + b"\x00\x00\x00\x01\x00"
+        + b"\x00\x00\x00\x01\x00"   # IP=0.0.0.1 (SOCKS4a) + empty user-id
         + host_b
     )
     resp = _recvall_sock(sock, 8)
@@ -129,13 +146,19 @@ def _connect_via_chain(
     timeout: int = 12,
 ) -> socket.socket:
     """
-    Return a socket tunneled through Tor → exit proxy → target host:port.
-    The caller is responsible for closing the socket.
+    Return a socket already tunneled through Tor → exit proxy → target host:port.
+    The caller owns the socket and must close it.
+
+    Path: us → Tor (SOCKS5 at 127.0.0.1:tor_port)
+              → exit proxy (SOCKS4/5 at proxy_host:proxy_port)
+                  → target_host:target_port
     """
     sock = socks_mod.socksocket()
     sock.set_proxy(socks_mod.SOCKS5, "127.0.0.1", tor_port, rdns=True)
     sock.settimeout(timeout)
-    sock.connect((proxy_host, proxy_port))
+    sock.connect((proxy_host, proxy_port))   # Tor reaches the exit proxy
+
+    # Now speak SOCKS to the exit proxy to reach the final target
     if proxy_proto.lower() == "socks4":
         _socks4_tunnel(sock, target_host, target_port)
     else:
@@ -143,16 +166,20 @@ def _connect_via_chain(
     return sock
 
 
-# ── Per-proxy check primitives ────────────────────────────────────────────────
+# ── Per-check primitives ──────────────────────────────────────────────────────
 
 def _cert_via_chain(
     proxy_host: str, proxy_port: int, proxy_proto: str,
     tor_port: int, host: str,
 ) -> Optional[str]:
-    """SHA-256 fingerprint of the TLS cert seen through Tor → proxy → host."""
+    """
+    Return the SHA-256 fingerprint of the TLS certificate presented by host
+    when connecting through Tor → exit proxy.
+    Returns None if the connection or handshake fails.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.verify_mode = ssl.CERT_NONE   # we compare fingerprints manually
     try:
         sock = _connect_via_chain(proxy_host, proxy_port, proxy_proto, tor_port, host, 443)
         with ctx.wrap_socket(sock, server_hostname=host) as tls:
@@ -166,13 +193,16 @@ def _headers_via_chain(
     tor_port: int,
 ) -> Optional[set]:
     """
-    Send a plain HTTP request through Tor → proxy → httpbin.org/headers.
+    Send a plain HTTP request to httpbin.org/headers through the chain.
+    httpbin returns the request headers it received as JSON.
+
     Returns the set of injected proxy-related header names, or None on error.
+    An empty set means no injection was detected.
     """
     try:
         sock = _connect_via_chain(
             proxy_host, proxy_port, proxy_proto,
-            tor_port, _HEADER_HOST, 80,
+            tor_port, _HEADER_HOST, 80,   # plain HTTP so the proxy can see headers
         )
         req = (
             f"GET {_HEADER_PATH} HTTP/1.0\r\n"
@@ -189,6 +219,7 @@ def _headers_via_chain(
         sock.close()
         body = raw.split(b"\r\n\r\n", 1)[-1].decode(errors="ignore")
         data = json.loads(body)
+        # Intersect received headers with the known proxy-injection list
         seen = {k.lower() for k in data.get("headers", {}).keys()}
         return seen & _PROXY_HEADERS
     except Exception:
@@ -198,6 +229,7 @@ def _headers_via_chain(
 # ── Baseline (direct, no proxy) ───────────────────────────────────────────────
 
 def _get_cert_direct(host: str, timeout: int = 10) -> Optional[str]:
+    """SHA-256 fingerprint of host's TLS cert via a direct connection (no proxy)."""
     ctx = ssl.create_default_context()
     try:
         with socket.create_connection((host, 443), timeout=timeout) as raw:
@@ -208,130 +240,20 @@ def _get_cert_direct(host: str, timeout: int = 10) -> Optional[str]:
 
 
 def fetch_baseline_fingerprints() -> Dict[str, str]:
-    """Fetch TLS cert fingerprints directly (no proxy) for all baseline endpoints."""
+    """Fetch TLS cert fingerprints for all baseline endpoints directly (no proxy)."""
     return {host: _get_cert_direct(host) for host in _BASELINE_ENDPOINTS}
 
 
-# ── Active-chain checks (existing API, unchanged) ─────────────────────────────
-
-def _get_cert_fingerprint_via_proxy(host: str, local_port: int, timeout: int = 15) -> Optional[str]:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        raw = socks_mod.socksocket()
-        raw.set_proxy(socks_mod.SOCKS5, "127.0.0.1", local_port)
-        raw.settimeout(timeout)
-        raw.connect((host, 443))
-        with ctx.wrap_socket(raw, server_hostname=host) as tls:
-            return hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
-    except Exception:
-        return None
-
-
-def check_tls_cert(local_port: int) -> CheckResult:
-    mismatches, errors = [], []
-    for host in _BASELINE_ENDPOINTS:
-        direct  = _get_cert_direct(host)
-        proxied = _get_cert_fingerprint_via_proxy(host, local_port)
-        if direct is None or proxied is None:
-            errors.append(host)
-        elif direct != proxied:
-            mismatches.append(host)
-    if mismatches:
-        return CheckResult("TLS certificate", Status.FAIL,
-            f"Cert mismatch on: {', '.join(mismatches)} — proxy may be intercepting TLS")
-    if errors:
-        return CheckResult("TLS certificate", Status.ERROR,
-            f"Could not compare certs for: {', '.join(errors)}")
-    return CheckResult("TLS certificate", Status.PASS,
-        f"Fingerprints match on all {len(_BASELINE_ENDPOINTS)} endpoints")
-
-
-def check_header_injection(local_port: int) -> CheckResult:
-    proxies = {
-        "http":  f"socks5h://127.0.0.1:{local_port}",
-        "https": f"socks5h://127.0.0.1:{local_port}",
-    }
-    try:
-        r = requests.get(f"http://{_HEADER_HOST}{_HEADER_PATH}", proxies=proxies, timeout=20)
-        injected = {k.lower() for k in r.json().get("headers", {}).keys()} & _PROXY_HEADERS
-        if injected:
-            return CheckResult("Header injection", Status.WARN,
-                f"Proxy headers in upstream request: {', '.join(sorted(injected))}")
-        return CheckResult("Header injection", Status.PASS,
-            "No proxy headers injected into upstream HTTP request")
-    except Exception as e:
-        return CheckResult("Header injection", Status.ERROR, f"Unreachable: {e}")
-
-
-def check_ssl_stripping(local_port: int) -> CheckResult:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        raw = socks_mod.socksocket()
-        raw.set_proxy(socks_mod.SOCKS5, "127.0.0.1", local_port)
-        raw.settimeout(15)
-        raw.connect(("ipinfo.io", 443))
-        with ctx.wrap_socket(raw, server_hostname="ipinfo.io") as tls:
-            cipher = tls.cipher()
-            if cipher:
-                return CheckResult("SSL stripping", Status.PASS, f"TLS OK ({cipher[0]})")
-            return CheckResult("SSL stripping", Status.WARN, "TLS established, cipher unavailable")
-    except ssl.SSLError as e:
-        return CheckResult("SSL stripping", Status.FAIL, f"TLS handshake failed: {e}")
-    except Exception as e:
-        return CheckResult("SSL stripping", Status.ERROR, f"Connection error: {e}")
-
-
-def run_mitm_checks(local_port: int) -> List[CheckResult]:
-    checks = [
-        ("Checking TLS certificates...", lambda: check_tls_cert(local_port)),
-        ("Checking header injection...", lambda: check_header_injection(local_port)),
-        ("Checking SSL stripping...",    lambda: check_ssl_stripping(local_port)),
-    ]
-    results = []
-    for label, fn in checks:
-        console.print(f"[dim]  {label}[/dim]", end="\r")
-        results.append(fn())
-    return results
-
-
-def display_mitm_results(results: List[CheckResult]):
-    STATUS_STYLE = {
-        Status.PASS:    "[green]PASS[/green]",
-        Status.WARN:    "[yellow]WARN[/yellow]",
-        Status.FAIL:    "[red]FAIL[/red]",
-        Status.ERROR:   "[dim]ERR[/dim]",
-        Status.TIMEOUT: "[dim]TIME[/dim]",
-    }
-    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
-    table.add_column("Status", no_wrap=True, width=6)
-    table.add_column("Check",  style="bold", no_wrap=True)
-    table.add_column("Detail", style="dim")
-
-    has_fail = any(r.status == Status.FAIL for r in results)
-    has_warn = any(r.status == Status.WARN for r in results)
-    for r in results:
-        table.add_row(STATUS_STYLE[r.status], r.name, r.detail)
-
-    if has_fail:
-        border, title = "red",    "[bold red]⚠  MITM check — SUSPICIOUS[/bold red]"
-    elif has_warn:
-        border, title = "yellow", "[bold yellow]⚠  MITM check — warnings[/bold yellow]"
-    else:
-        border, title = "green",  "[bold green]✓  MITM check — clean[/bold green]"
-    console.print(Panel(table, title=title, border_style=border, padding=(0, 1)))
-
-
-# ── Bulk scan ─────────────────────────────────────────────────────────────────
+# ── Single-proxy scan ─────────────────────────────────────────────────────────
 
 def _scan_one(proxy, tor_port: int, baseline: Dict[str, str]) -> ScanResult:
-    """Run TLS + header checks on a single proxy through the Tor chain."""
-    from proxy_scraper import Proxy  # avoid circular at module level
+    """
+    Run TLS + header checks on a single proxy through the Tor chain.
+    baseline: {host: expected_fingerprint} from fetch_baseline_fingerprints().
+    """
+    from proxy_scraper import Proxy  # avoid circular import at module level
 
-    # TLS check
+    # ── TLS check ────────────────────────────────────────────────────────────
     tls_status = Status.ERROR
     for host, expected in baseline.items():
         if expected is None:
@@ -341,11 +263,11 @@ def _scan_one(proxy, tor_port: int, baseline: Dict[str, str]) -> ScanResult:
             tls_status = Status.TIMEOUT
             break
         if got != expected:
-            tls_status = Status.FAIL
+            tls_status = Status.FAIL   # cert mismatch = MITM
             break
         tls_status = Status.PASS
 
-    # Header injection check
+    # ── Header injection check (only if proxy seems reachable) ────────────────
     injected: List[str] = []
     if tls_status not in (Status.TIMEOUT, Status.ERROR):
         found = _headers_via_chain(proxy.host, proxy.port, proxy.proto, tor_port)
@@ -359,7 +281,7 @@ def _scan_one(proxy, tor_port: int, baseline: Dict[str, str]) -> ScanResult:
     else:
         headers_status = Status.TIMEOUT
 
-    # Overall verdict
+    # ── Overall verdict ───────────────────────────────────────────────────────
     if tls_status == Status.FAIL:
         verdict = Status.FAIL
     elif tls_status in (Status.TIMEOUT, Status.ERROR) and headers_status in (Status.TIMEOUT, Status.ERROR):
@@ -383,13 +305,16 @@ def _scan_one(proxy, tor_port: int, baseline: Dict[str, str]) -> ScanResult:
     )
 
 
+# ── Bulk scan entry point ─────────────────────────────────────────────────────
+
 def scan_all_proxies(
     proxies: list,
     tor_port: int,
     max_workers: int = 15,
 ) -> List[ScanResult]:
     """
-    Scan a list of proxies for MITM behavior in parallel.
+    Scan a list of proxies for MITM behaviour in parallel.
+    Fetches the TLS baseline once, then tests each proxy concurrently.
     Returns results in completion order.
     """
     console.print("[cyan]Fetching TLS baseline (direct connection)...[/cyan]")
@@ -415,7 +340,6 @@ def scan_all_proxies(
             total=len(proxies),
             mitm=0, warn=0, clean=0,
         )
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_scan_one, p, tor_port, baseline): p for p in proxies}
             for future in concurrent.futures.as_completed(futures):
@@ -428,6 +352,8 @@ def scan_all_proxies(
 
     return results
 
+
+# ── Display ───────────────────────────────────────────────────────────────────
 
 def _flag(cc: str) -> str:
     flags = {
@@ -442,7 +368,7 @@ def _flag(cc: str) -> str:
 
 
 def display_scan_results(results: List[ScanResult]):
-    """Display the bulk scan results table with per-proxy verdict and ratio summary."""
+    """Print the bulk scan table and a ratio summary panel."""
 
     VERDICT_BADGE = {
         Status.PASS:    "[green]CLEAN[/green]",
@@ -476,13 +402,12 @@ def display_scan_results(results: List[ScanResult]):
     order = {Status.FAIL: 0, Status.WARN: 1, Status.PASS: 2, Status.ERROR: 3, Status.TIMEOUT: 4}
     for r in sorted(results, key=lambda x: order.get(x.verdict, 9)):
         cc = r.country or "??"
-        cc_display = f"{_flag(cc)} {cc}"
         hdr_cell = (
             f"[yellow]{', '.join(r.injected_headers)}[/yellow]"
             if r.injected_headers else TLS_BADGE[r.headers]
         )
         table.add_row(
-            cc_display,
+            f"{_flag(cc)} {cc}",
             f"{r.proxy_host}:{r.proxy_port}",
             r.proxy_proto.upper(),
             TLS_BADGE[r.tls],
@@ -500,17 +425,13 @@ def display_scan_results(results: List[ScanResult]):
     n_clean = sum(1 for r in results if r.verdict == Status.PASS)
     n_err   = sum(1 for r in results if r.verdict in (Status.ERROR, Status.TIMEOUT))
 
-    ratio_mitm  = n_mitm  / total * 100 if total else 0
-    ratio_warn  = n_warn  / total * 100 if total else 0
-    ratio_clean = n_clean / total * 100 if total else 0
-
     summary = (
         f"  [bold]Tested:[/bold] {total} proxies\n"
-        f"  [red]MITM   :[/red]  {n_mitm:>4}  ({ratio_mitm:5.1f}%)\n"
-        f"  [yellow]Warn   :[/yellow]  {n_warn:>4}  ({ratio_warn:5.1f}%)\n"
-        f"  [green]Clean  :[/green]  {n_clean:>4}  ({ratio_clean:5.1f}%)\n"
+        f"  [red]MITM   :[/red]  {n_mitm:>4}  ({n_mitm/total*100:5.1f}%)\n"
+        f"  [yellow]Warn   :[/yellow]  {n_warn:>4}  ({n_warn/total*100:5.1f}%)\n"
+        f"  [green]Clean  :[/green]  {n_clean:>4}  ({n_clean/total*100:5.1f}%)\n"
         f"  [dim]Timeout/Err: {n_err}[/dim]"
-    )
+    ) if total else "  No results."
 
     border = "red" if n_mitm else ("yellow" if n_warn else "green")
     console.print(Panel(summary, title="[bold]Scan summary[/bold]", border_style=border, padding=(0, 2)))

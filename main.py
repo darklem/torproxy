@@ -42,7 +42,7 @@ from proxy_scraper import (
     filter_by_country,
     Proxy,
 )
-from proxy_chain import ProxyChainServer, get_chained_ip, DEFAULT_LOCAL_PORT, show_mitm_alert
+from proxy_chain import ProxyChainServer, get_chained_ip, DEFAULT_LOCAL_PORT
 from proxy_cache import (
     load_cached_proxies,
     save_proxies_to_cache,
@@ -53,10 +53,7 @@ from proxy_cache import (
     clear_pid,
     CACHE_TTL,
 )
-from mitm_check import (
-    run_mitm_checks, display_mitm_results,
-    scan_all_proxies, display_scan_results,
-)
+from mitm_check import scan_all_proxies, display_scan_results
 
 console = Console()
 
@@ -259,65 +256,20 @@ def _run_scan_mitm(tor_port_arg: Optional[int], limit: int):
 _log = logging.getLogger(__name__)
 
 
-def _run_mitm_and_react(server, local_port: int, alive_proxies: list, max_retries: int = 3):
+def _push_mitm_status(server, proxy):
     """
-    Run MITM checks after chain mount. On FAIL, auto-rotate and retry up to
-    max_retries times. Logs every individual check result + global verdict.
-    Stores result in server for the web admin UI.
+    Push the MITM status determined during pool build to the server so the
+    web admin UI can display it.  No extra network call — we reuse the
+    mitm_clean flag already set by _verify_via_chain on this proxy.
     """
-    from mitm_check import run_mitm_checks, display_mitm_results, Status
-
-    for attempt in range(1, max_retries + 1):
-        console.print()
-        label = "automatic at chain mount" if attempt == 1 else f"attempt {attempt}/{max_retries}"
-        console.print(f"[cyan]Running MITM detection ({label})...[/cyan]")
-
-        results = run_mitm_checks(local_port)
-        display_mitm_results(results)
-
-        # Log every individual check
-        for r in results:
-            lvl = _log.warning if r.status in (Status.FAIL, Status.WARN) else _log.info
-            lvl(f"MITM [{r.name}] {r.status.value.upper()} — {r.detail}")
-
-        has_fail = any(r.status == Status.FAIL for r in results)
-        has_warn = any(r.status == Status.WARN for r in results)
-        verdict = "fail" if has_fail else "warn" if has_warn else "pass"
-
-        # Push state to the server for the web UI
-        checks_payload = [
-            {"name": r.name, "status": r.status.value, "detail": r.detail}
-            for r in results
-        ]
-        server.set_mitm_result(verdict, checks_payload)
-
-        proxy_label = f"{server.exit_proxy.address} ({server.exit_proxy.country or '??'})"
-
-        if has_fail or has_warn:
-            show_mitm_alert(server.exit_proxy.address, checks_payload)
-
-        if has_fail:
-            _log.warning(f"MITM DETECTED on {proxy_label} — rotating to next proxy")
-            if len(alive_proxies) > 1:
-                server.rotate()
-                time.sleep(3)
-            else:
-                _log.warning("MITM detected but pool has only one proxy — cannot rotate")
-                console.print("[yellow]No alternative proxy in pool — cannot rotate.[/yellow]")
-                break
-        elif has_warn:
-            _log.warning(f"MITM warning on {proxy_label} — proceeding with caution")
-            break
-        else:
-            _log.info(f"MITM check PASSED on {proxy_label} — proxy is clean")
-            console.print(f"[green]✓ MITM check passed — {server.exit_proxy.address} is clean[/green]")
-            break
-    else:
-        _log.warning(f"MITM check FAILED after {max_retries} attempts — chain may be compromised")
-        console.print(
-            f"[red bold]⚠ MITM still detected after {max_retries} proxy rotations. "
-            "Use with caution.[/red bold]"
-        )
+    verdict = "pass" if proxy.mitm_clean else "fail"
+    checks = [{
+        "name": "TLS certificate fingerprint (ipconfig.io)",
+        "status": verdict,
+        "detail": "Verified via Tor → proxy → ipconfig.io during pool build",
+    }]
+    server.set_mitm_result(verdict, checks)
+    _log.info(f"MITM status for {proxy.address}: {verdict.upper()}")
 
 
 def run(
@@ -327,7 +279,6 @@ def run(
     list_countries_only: bool,
     skip_verify: bool,
     tor_port_arg: int = None,
-    skip_mitm_check: bool = False,
     watchdog_interval: int = 30,
     fail_threshold: int = 3,
     rate_limit_hosts: Optional[str] = None,
@@ -553,9 +504,8 @@ def run(
         console.print(f"[cyan]SOCKS5 server is active at socks5://127.0.0.1:{local_port}[/cyan]")
         _log.warning("Chain IP verification failed after 3 attempts — proxy may be unresponsive")
 
-    # ── MITM check (automatic at chain mount) ────────────────────────────────
-    if not skip_mitm_check:
-        _run_mitm_and_react(server, local_port, alive_proxies)
+    # MITM status comes from the pool-build check (no extra connection needed).
+    _push_mitm_status(server, server.exit_proxy)
 
     # ── Headless mode — block until signal ───────────────────────────────────
     if headless:
@@ -585,7 +535,6 @@ def run(
         "  [cyan][r][/cyan] → Rotate exit proxy\n"
         "  [cyan][n][/cyan] → New Tor circuit\n"
         "  [cyan][i][/cyan] → Check current IP\n"
-        "  [cyan][m][/cyan] → Re-run MITM detection\n"
         "  [cyan][d][/cyan] → Detach (exit UI, keep server running)\n"
         "  [cyan][q][/cyan] → Quit and stop server",
         title="⌨️  Controls",
@@ -608,7 +557,7 @@ def run(
         try:
             cmd = Prompt.ask(
                 "\n[bold cyan]>[/bold cyan]",
-                choices=["r", "n", "i", "m", "d", "q"],
+                choices=["r", "n", "i", "d", "q"],
                 show_choices=True,
             ).strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -655,11 +604,6 @@ def run(
             else:
                 console.print("[yellow]  Could not retrieve IP.[/yellow]")
 
-        elif cmd == "m":
-            console.print("[cyan]Running MITM detection...[/cyan]")
-            results = run_mitm_checks(local_port)
-            display_mitm_results(results)
-
     if detached:
         console.print("[dim]Detached session. Proxy remains active. (Ctrl+C to force stop)[/dim]")
         try:
@@ -688,7 +632,6 @@ def run(
 @click.option("--tor-port",             default=None,                type=int,        help="Use an already-running Tor SOCKS port (skip starting Tor).")
 @click.option("--verbose",        "-v", is_flag=True, default=False,                 help="Verbose output.")
 @click.option("--skip-verify",          is_flag=True, default=False,                 help="Skip proxy liveness check (faster startup).")
-@click.option("--skip-mitm-check",      is_flag=True, default=False,                 help="Skip automatic MITM detection after chain setup.")
 @click.option("--scan-mitm",            is_flag=True, default=False,                 help="Scan all proxies in the cache for MITM and show a report.")
 @click.option("--scan-limit",           default=200,  show_default=True, type=int,   help="Max number of proxies to test during --scan-mitm.")
 @click.option("--kill",             "-k", is_flag=True, default=False,                   help="Stop a detached TorProxy-Chain server.")
@@ -698,7 +641,7 @@ def run(
 @click.option("--rate-limit-hosts",       default="",                                    help="Extra redirect hostnames that trigger auto-rotation (comma-separated).")
 @click.option("--headless",               is_flag=True, default=False,                   help="Headless mode: no interactive prompts, block until SIGTERM.")
 @click.option("--status-port",            default=None, type=int,                        help="Enable HTTP status API on this port (e.g. 10801).")
-def main(country, list_countries, local_port, tor_port, verbose, skip_verify, skip_mitm_check, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts, headless, status_port):
+def main(country, list_countries, local_port, tor_port, verbose, skip_verify, scan_mitm, scan_limit, kill, clear_cache, watchdog_interval, fail_threshold, rate_limit_hosts, headless, status_port):
     if kill:
         info = read_pid()
         if not info:
@@ -737,7 +680,6 @@ def main(country, list_countries, local_port, tor_port, verbose, skip_verify, sk
         list_countries_only=list_countries,
         skip_verify=skip_verify,
         tor_port_arg=tor_port,
-        skip_mitm_check=skip_mitm_check,
         watchdog_interval=watchdog_interval,
         fail_threshold=fail_threshold,
         rate_limit_hosts=rate_limit_hosts or None,

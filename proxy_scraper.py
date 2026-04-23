@@ -203,33 +203,60 @@ def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = 
 
 
 # ── ipconfig.io baseline + full-chain verification ────────────────────────────
+#
+# Design goal: ONE TCP connection per proxy does BOTH geolocation AND MITM
+# detection.  No second request, no second host, no second TLS handshake.
+#
+# Chain under test:
+#   us → Tor (SOCKS5 at 127.0.0.1:tor_port)
+#       → exit proxy (SOCKS4/5 at proxy.host:proxy.port)
+#           → ipconfig.io:443 (HTTPS)
+#
+# What we learn from a single successful connection:
+#   • Proxy is alive and routes HTTPS traffic.
+#   • Exit IP geolocation (country_code, country) from the JSON body.
+#   • Whether a TLS MITM is in place: compare the certificate fingerprint
+#     seen through the chain against one fetched directly (no proxy).
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_ipconfig_baseline() -> Optional[str]:
     """
-    Return the SHA-256 fingerprint (hex) of ipconfig.io's TLS cert obtained via a direct
-    connection (no proxy). Result is cached for the process lifetime.
-    Returns None if the direct fetch failed — callers should skip the comparison.
+    Fetch the SHA-256 fingerprint of ipconfig.io's TLS certificate via a
+    direct connection (no Tor, no proxy) and cache it for the process lifetime.
+
+    This is the reference value.  Every proxy we test must present the same
+    certificate to ipconfig.io; a different fingerprint means something on the
+    path is intercepting TLS and substituting its own certificate (MITM).
+
+    Returns the hex fingerprint string, or None if the direct fetch failed
+    (network unavailable, firewall, …).  Callers treat None as "skip comparison
+    and give proxy the benefit of the doubt."
     """
     global _ipconfig_baseline
     with _ipconfig_baseline_lock:
+        # "" is our sentinel meaning "fetch was attempted and failed".
         if _ipconfig_baseline is not None:
-            return _ipconfig_baseline or None   # "" → None
+            return _ipconfig_baseline or None
         try:
-            ctx = ssl.create_default_context()
+            ctx = ssl.create_default_context()   # uses system CA bundle
             raw = socket.create_connection((_IPCONFIG_HOST, _IPCONFIG_PORT), timeout=10)
             tls = ctx.wrap_socket(raw, server_hostname=_IPCONFIG_HOST)
-            cert_der = tls.getpeercert(binary_form=True)
+            cert_der = tls.getpeercert(binary_form=True)   # raw DER bytes
             tls.close()
             _ipconfig_baseline = hashlib.sha256(cert_der).hexdigest()
-            logger.debug(f"ipconfig.io baseline TLS fingerprint: {_ipconfig_baseline[:16]}…")
+            logger.debug(f"ipconfig.io TLS baseline: {_ipconfig_baseline[:16]}…")
             return _ipconfig_baseline
         except Exception as exc:
             logger.debug(f"ipconfig.io baseline fetch failed: {exc}")
-            _ipconfig_baseline = ""  # sentinel: failed, skip comparison
+            _ipconfig_baseline = ""   # prevent future retries
             return None
 
 
 def _recv_exact(sock, n: int) -> bytes:
+    """
+    Read exactly n bytes from a socket, handling TCP fragmentation.
+    Raises ConnectionError if the socket closes before n bytes are received.
+    """
     data = b""
     while len(data) < n:
         chunk = sock.recv(n - len(data))
@@ -240,67 +267,115 @@ def _recv_exact(sock, n: int) -> bytes:
 
 
 def _socks5_connect_to(sock, host: str, port: int) -> bool:
-    """Run the SOCKS5 client handshake to reach host:port over an already-open socket."""
+    """
+    Speak the SOCKS5 client protocol over an already-open socket to ask the
+    SOCKS5 server (= our exit proxy) to tunnel us to host:port.
+
+    SOCKS5 wire format (RFC 1928):
+      Greeting  → VER(1) NMETHODS(1) METHODS(N)
+      Response  ← VER(1) METHOD(1)          [0x00 = no auth]
+      Request   → VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR DST.PORT(2)
+      Response  ← VER(1) REP(1) RSV(1) ATYP(1) BND.ADDR BND.PORT(2)
+
+    We always request ATYP=0x03 (domain name) so the exit proxy resolves
+    the hostname, not us.  Returns True on success (REP=0x00).
+    """
     try:
-        sock.sendall(b"\x05\x01\x00")          # VER=5, 1 method: no-auth
-        if _recv_exact(sock, 2)[1] != 0x00:    # server chose no-auth
+        # Offer "no authentication" as the only method
+        sock.sendall(b"\x05\x01\x00")
+        if _recv_exact(sock, 2)[1] != 0x00:   # server must accept no-auth
             return False
+
         host_b = host.encode("idna")
-        req = (b"\x05\x01\x00\x03"             # VER CMD RSV ATYP=domain
-               + bytes([len(host_b)]) + host_b
-               + struct.pack("!H", port))
-        sock.sendall(req)
+        sock.sendall(
+            b"\x05\x01\x00\x03"                       # VER CMD RSV ATYP=domain
+            + bytes([len(host_b)]) + host_b            # DST.ADDR
+            + struct.pack("!H", port)                  # DST.PORT
+        )
+
+        # Read the fixed 4-byte response header
         hdr = _recv_exact(sock, 4)
-        if hdr[1] != 0x00:                     # REP must be 0x00 (success)
+        if hdr[1] != 0x00:   # REP=0x00 means success
             return False
+
+        # Consume the variable-length BND.ADDR + BND.PORT so the socket
+        # is positioned at the start of the proxied data stream.
         atyp = hdr[3]
-        if atyp == 0x01:
-            _recv_exact(sock, 4 + 2)
-        elif atyp == 0x03:
-            n = _recv_exact(sock, 1)[0]
-            _recv_exact(sock, n + 2)
-        elif atyp == 0x04:
-            _recv_exact(sock, 16 + 2)
+        if atyp == 0x01:               # IPv4: 4 bytes + 2 port
+            _recv_exact(sock, 6)
+        elif atyp == 0x03:             # domain: 1-byte length + N bytes + 2 port
+            _recv_exact(sock, _recv_exact(sock, 1)[0] + 2)
+        elif atyp == 0x04:             # IPv6: 16 bytes + 2 port
+            _recv_exact(sock, 18)
         return True
     except Exception:
         return False
 
 
 def _socks4a_connect_to(sock, host: str, port: int) -> bool:
-    """Run the SOCKS4a client handshake to reach host:port over an already-open socket."""
+    """
+    Speak the SOCKS4a protocol over an already-open socket.
+
+    SOCKS4a extends SOCKS4 by allowing hostname resolution at the server side:
+    setting the IP to 0.0.0.x (non-routable) signals that a hostname follows
+    after the user-id field.
+
+    Wire format (single request/response):
+      Request  → VER(1) CMD(1) PORT(2) IP(4) USERID NUL HOSTNAME NUL
+      Response ← VER(1) REP(1) PORT(2) IP(4)       [REP=0x5A = granted]
+    """
     try:
         host_b = host.encode("ascii") + b"\x00"
-        # SOCKS4a: IP 0.0.0.1 signals hostname follows after user-id
-        req = struct.pack("!BBHBBBB", 4, 1, port, 0, 0, 0, 1) + b"\x00" + host_b
-        sock.sendall(req)
+        sock.sendall(
+            struct.pack("!BBHBBBB", 4, 1, port, 0, 0, 0, 1)  # IP=0.0.0.1 → SOCKS4a
+            + b"\x00"                                          # empty user-id
+            + host_b                                           # hostname + NUL
+        )
         resp = _recv_exact(sock, 8)
-        return resp[1] == 0x5A                 # 0x5A = request granted
+        return resp[1] == 0x5A   # 0x5A = request granted
     except Exception:
         return False
 
 
 def _verify_via_chain(proxy: Proxy, tor_port: int) -> Proxy:
     """
-    Full chain verification: Tor → exit-proxy → ipconfig.io:443 (HTTPS).
+    Verify a proxy through the full chain in a single TCP connection.
 
-    On success:
-      - proxy.alive = True
-      - proxy.latency_ms set
-      - proxy.country / country_name set from ipconfig.io JSON response
-      - proxy.mitm_clean = False if TLS cert differs from the direct baseline
+    Path:  us → Tor → exit proxy → ipconfig.io:443
 
-    On any failure:
-      - proxy.alive = False
+    One connection does everything:
+      1. Confirm the proxy is alive and reachable via Tor.
+      2. Confirm the proxy routes HTTPS traffic end-to-end.
+      3. Detect MITM: compare the TLS certificate fingerprint against the
+         direct (no-proxy) baseline fetched by _get_ipconfig_baseline().
+      4. Geolocate the exit IP: parse country_code / country from the JSON
+         body returned by ipconfig.io/json.
+
+    Results written to the proxy object:
+      proxy.alive        — True if all steps succeeded
+      proxy.latency_ms   — round-trip time to first byte of response
+      proxy.country      — ISO-2 code of the exit IP (from ipconfig.io)
+      proxy.country_name — full country name
+      proxy.mitm_clean   — False if the TLS cert fingerprint differs from
+                           the direct baseline (MITM suspected)
+
+    On any failure proxy.alive is set to False and the proxy is discarded.
     """
     start = time.monotonic()
     try:
-        # 1. Connect to exit proxy through Tor
+        # ── 1. Open a socket through Tor to the exit proxy ───────────────────
+        # PySocks transparently tunnels the TCP connection through Tor's
+        # SOCKS5 interface.  After .connect() the socket carries traffic
+        # between us and the exit proxy, via Tor.
         s = socks.socksocket()
         s.set_proxy(socks.SOCKS5, "127.0.0.1", tor_port)
         s.settimeout(_CHAIN_VERIFY_TIMEOUT)
         s.connect((proxy.host, proxy.port))
+        # Path so far:  us ←TCP→ Tor ←TCP→ exit proxy
 
-        # 2. SOCKS handshake: exit proxy → ipconfig.io:443
+        # ── 2. Ask the exit proxy to connect to ipconfig.io:443 ──────────────
+        # We speak SOCKS5 (or SOCKS4a) directly over the existing socket.
+        # The exit proxy opens its own connection to ipconfig.io on our behalf.
         if proxy.proto == "socks5":
             ok = _socks5_connect_to(s, _IPCONFIG_HOST, _IPCONFIG_PORT)
         else:
@@ -309,13 +384,21 @@ def _verify_via_chain(proxy: Proxy, tor_port: int) -> Proxy:
         if not ok:
             proxy.alive = False
             return proxy
+        # Path now:  us ←TCP→ Tor ←TCP→ exit proxy ←TCP→ ipconfig.io:443
 
-        # 3. TLS — verify cert against direct baseline
+        # ── 3. TLS handshake + MITM detection ────────────────────────────────
+        # Wrap the socket in TLS.  The system CA bundle validates the cert
+        # chain, so a self-signed or unknown-CA certificate will raise here.
         ctx = ssl.create_default_context()
         tls = ctx.wrap_socket(s, server_hostname=_IPCONFIG_HOST)
 
+        # Extract the raw DER certificate and fingerprint it.
         cert_der = tls.getpeercert(binary_form=True)
         fp = hashlib.sha256(cert_der).hexdigest()
+
+        # Compare against the baseline fetched without any proxy.
+        # If they differ, the exit proxy (or something between it and us)
+        # is presenting its own certificate — classic TLS MITM.
         baseline = _get_ipconfig_baseline()
         if baseline and fp != baseline:
             proxy.mitm_clean = False
@@ -323,17 +406,23 @@ def _verify_via_chain(proxy: Proxy, tor_port: int) -> Proxy:
                 f"MITM cert mismatch on {proxy.address}: "
                 f"got {fp[:16]}… expected {baseline[:16]}…"
             )
+        # baseline=None means the direct fetch failed; we skip the comparison
+        # and leave mitm_clean=True (benefit of the doubt).
 
-        # 4. HTTP GET /json
-        tls.sendall(
+        # ── 4. HTTP GET /json — one request, two results ──────────────────────
+        # We reuse the TLS connection we already have (no extra round-trip).
+        # ipconfig.io sees the request arriving from the exit proxy's IP and
+        # returns geolocation data (country_code, country, city, …) for it.
+        tls.sendall((
             f"GET /json HTTP/1.1\r\n"
             f"Host: {_IPCONFIG_HOST}\r\n"
             f"Accept: application/json\r\n"
-            f"Connection: close\r\n\r\n".encode()
-        )
+            f"Connection: close\r\n\r\n"
+        ).encode())
 
+        # Read up to 16 KB.  The /json response is tiny (~200 bytes); the cap
+        # prevents hanging if a broken proxy sends garbage indefinitely.
         data = b""
-        tls.settimeout(_CHAIN_VERIFY_TIMEOUT)
         while len(data) < 16384:
             try:
                 chunk = tls.recv(4096)
@@ -344,7 +433,9 @@ def _verify_via_chain(proxy: Proxy, tor_port: int) -> Proxy:
                 break
         tls.close()
 
-        # 5. Parse JSON from response body
+        # ── 5. Parse geolocation from the JSON body ───────────────────────────
+        # We use a regex instead of splitting on \r\n\r\n so chunked
+        # Transfer-Encoding is handled without a full HTTP parser.
         m = re.search(rb'\{[^{}]+\}', data)
         if m:
             info = _json.loads(m.group().decode("utf-8", errors="ignore"))
@@ -355,10 +446,13 @@ def _verify_via_chain(proxy: Proxy, tor_port: int) -> Proxy:
             if isinstance(cn, str):
                 proxy.country_name = cn
 
+        # ── Done ─────────────────────────────────────────────────────────────
         proxy.latency_ms = (time.monotonic() - start) * 1000
         proxy.alive = True
 
     except Exception as exc:
+        # Any failure (proxy down, Tor error, TLS error, timeout, …) marks
+        # the proxy as dead.  Details go to DEBUG to avoid cluttering output.
         logger.debug(f"_verify_via_chain({proxy.address}): {exc}")
         proxy.alive = False
 

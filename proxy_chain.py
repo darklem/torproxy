@@ -32,42 +32,6 @@ DEFAULT_LOCAL_PORT = 10800
 LOCAL_BIND = "0.0.0.0"   # listen on all interfaces so LAN devices can use the proxy
 
 
-def show_mitm_alert(proxy_addr: str, checks: list):
-    """
-    Display a prominent Rich panel when MITM is detected.
-    checks: list of dicts {name, status, detail} — same format as set_mitm_result payload.
-    """
-    has_fail = any(c["status"] == "fail" for c in checks)
-    has_warn = any(c["status"] in ("fail", "warn") for c in checks)
-    if not has_warn:
-        return
-
-    icon = "⛔" if has_fail else "⚠"
-    title = (
-        f"{icon}  MITM DETECTED — PROXY IS INTERCEPTING YOUR TRAFFIC"
-        if has_fail else
-        f"{icon}  MITM WARNING — PROXY BEHAVIOUR IS SUSPICIOUS"
-    )
-    border = "red" if has_fail else "yellow"
-
-    lines = [f"[bold]Proxy:[/bold] [cyan]{proxy_addr}[/cyan]\n"]
-    status_colors = {"pass": "green", "warn": "yellow", "fail": "red",
-                     "error": "dim", "timeout": "dim"}
-    for c in checks:
-        color = status_colors.get(c["status"], "dim")
-        badge = f"[{color}][{c['status'].upper():7}][/{color}]"
-        lines.append(f"  {badge}  {c['name']}")
-        if c.get("detail"):
-            lines.append(f"             [dim]{c['detail']}[/dim]")
-
-    console.print(Panel(
-        "\n".join(lines),
-        title=f"[bold]{title}[/bold]",
-        border_style=border,
-        padding=(1, 2),
-    ))
-
-
 # ── Reliable recv ─────────────────────────────────────────────────────────────
 
 def _recvall(sock: socket.socket, n: int) -> bytes:
@@ -369,7 +333,7 @@ async function refresh(){
     document.getElementById('mitm-card').innerHTML=`
       <h2>MITM Detection</h2>
       <div class="stat"><div class="stat-label">Verdict</div><div class="stat-value ${mvcol}">${mvlabel}</div></div>
-      <div class="stat"><div class="stat-label">Last check</div><div class="stat-value">${fmtTime(st.mitm_last_check)}</div></div>
+      <div class="stat"><div class="stat-label">Verified at</div><div class="stat-value">${fmtTime(st.mitm_last_check)}</div></div>
       ${checkRows?`<br><br><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>${checkRows}</tbody></table>`:''}
     `;
     const rows=pool.map(p=>`<tr class="${p.active?'active-row':''}">
@@ -578,47 +542,9 @@ class ProxyChainServer:
         with self._lock:
             self._rotation_in_progress = False
 
-        # Announce new IP + re-run MITM check in background (not for mitm-triggered rotations
-        # to avoid infinite loop: mitm-detected → rotate → mitm-detected → …)
+        # Announce the new public IP in a background thread so we don't
+        # block the caller while the chain settles.
         threading.Thread(target=self._announce_new_ip, daemon=True).start()
-        if reason != "mitm-detected":
-            threading.Thread(target=self._mitm_check_post_rotate, daemon=True).start()
-
-    def _mitm_check_post_rotate(self):
-        """Run MITM checks after a proxy rotation. Rotates once more if FAIL detected."""
-        try:
-            from mitm_check import run_mitm_checks, Status
-            time.sleep(4)   # let chain settle before probing
-            proxy = self.exit_proxy
-            logger.info(f"MITM check after rotation: {proxy.address} ({proxy.country or '??'})")
-            results = run_mitm_checks(self.local_port)
-
-            has_fail = any(r.status == Status.FAIL for r in results)
-            has_warn = any(r.status == Status.WARN for r in results)
-            verdict = "fail" if has_fail else "warn" if has_warn else "pass"
-
-            for r in results:
-                lvl = logger.warning if r.status in (Status.FAIL, Status.WARN) else logger.info
-                lvl(f"MITM [{r.name}] {r.status.value.upper()} — {r.detail}")
-
-            checks_payload = [
-                {"name": r.name, "status": r.status.value, "detail": r.detail}
-                for r in results
-            ]
-            self.set_mitm_result(verdict, checks_payload)
-            if has_fail or has_warn:
-                show_mitm_alert(proxy.address, checks_payload)
-
-            if has_fail:
-                logger.warning(f"MITM DETECTED on {proxy.address} — rotating again")
-                self._auto_rotate("mitm-detected")
-            elif has_warn:
-                logger.warning(f"MITM warning on {proxy.address} — proceeding with caution")
-            else:
-                logger.info(f"MITM check PASSED on {proxy.address} — proxy is clean")
-                console.print(f"[green]✓ MITM check passed — {proxy.address} is clean[/green]")
-        except Exception as e:
-            logger.debug(f"MITM post-rotate check error: {e}")
 
     def _on_chain_failure(self):
         """Called by _ClientHandler when a connection through the chain fails."""
@@ -770,7 +696,13 @@ class ProxyChainServer:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_mitm_result(self, verdict: str, checks: List[dict]):
-        """Store the latest MITM check result (called from main after each check run)."""
+        """
+        Store the MITM check result for the web admin UI.
+        Called once from main.py after the proxy pool is built, using the
+        mitm_clean flag set by _verify_via_chain during cache construction.
+        verdict: "pass" | "fail"
+        checks:  list of {name, status, detail} dicts (one entry per check performed)
+        """
         with self._lock:
             self._mitm_verdict = verdict
             self._mitm_last_check = datetime.datetime.utcnow()
