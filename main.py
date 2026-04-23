@@ -468,22 +468,24 @@ def run(
         )
 
         mitm_clean = [p for p in all_alive if p.mitm_clean]
-        mitm_dirty_count = len(all_alive) - len(mitm_clean)
+        mitm_dirty = [p for p in all_alive if not p.mitm_clean]
 
-        if mitm_dirty_count:
+        # Persist ALL alive proxies — clean and dirty.
+        # Dirty ones are stored so they are not re-tested needlessly;
+        # load_cached_proxies(mitm_clean_only=True) keeps them out of the pool.
+        if all_alive:
+            save_proxies_to_cache(all_alive)
             console.print(
-                f"[yellow]  {mitm_dirty_count} proxies excluded "
-                f"(TLS cert mismatch — MITM suspected)[/yellow]"
+                f"[dim]  Cached {len(all_alive)} proxies "
+                f"({len(mitm_clean)} clean, {len(mitm_dirty)} MITM-dirty).[/dim]"
             )
 
-        # Only save MITM-clean proxies to the persistent cache
-        if mitm_clean:
-            save_proxies_to_cache(mitm_clean)
+        if mitm_dirty:
             console.print(
-                f"[dim]  Cached {len(mitm_clean)} MITM-clean proxies "
-                f"(geolocation from ipconfig.io).[/dim]"
+                f"[yellow]  {len(mitm_dirty)} MITM-dirty proxies stored but excluded from pool.[/yellow]"
             )
 
+        # Only present MITM-clean proxies to the chain
         if mitm_clean:
             alive_proxies = mitm_clean
         elif all_alive:
