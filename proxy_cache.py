@@ -38,6 +38,9 @@ _CREATE_TABLE = """
         latency_ms   REAL    NOT NULL DEFAULT -1,
         -- 1 = TLS cert matched the direct baseline (clean); 0 = mismatch (MITM suspected)
         mitm_clean   INTEGER NOT NULL DEFAULT 1,
+        -- 1 = proxy responded during last chain test; 0 = connection failed (HS)
+        -- geo-only entries (never chain-tested) keep the default value of 1
+        alive        INTEGER NOT NULL DEFAULT 1,
         checked_at   REAL    NOT NULL,
         PRIMARY KEY (host, port)
     )
@@ -47,6 +50,7 @@ _CREATE_TABLE = """
 _MIGRATIONS = {
     "latency_ms": "ALTER TABLE proxies ADD COLUMN latency_ms   REAL    NOT NULL DEFAULT -1",
     "mitm_clean": "ALTER TABLE proxies ADD COLUMN mitm_clean   INTEGER NOT NULL DEFAULT 1",
+    "alive":      "ALTER TABLE proxies ADD COLUMN alive        INTEGER NOT NULL DEFAULT 1",
 }
 
 
@@ -95,7 +99,7 @@ def load_cached_proxies(
             where += " AND mitm_clean = 1"
 
         rows = conn.execute(
-            f"""SELECT host, port, proto, country, country_name, latency_ms, mitm_clean
+            f"""SELECT host, port, proto, country, country_name, latency_ms, mitm_clean, alive
                 FROM proxies
                 WHERE {where}
                 ORDER BY latency_ms ASC""",
@@ -109,6 +113,7 @@ def load_cached_proxies(
                 country=r[3], country_name=r[4],
                 latency_ms=r[5],
                 mitm_clean=bool(r[6]),
+                alive=bool(r[7]),
             )
             for r in rows
         ]
@@ -161,12 +166,12 @@ def save_proxies_to_cache(proxies: List["Proxy"]) -> None:
         now = time.time()
         conn.executemany(
             """INSERT OR REPLACE INTO proxies
-               (host, port, proto, country, country_name, latency_ms, mitm_clean, checked_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (host, port, proto, country, country_name, latency_ms, mitm_clean, alive, checked_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (p.host, p.port, p.proto,
                  p.country, p.country_name,
-                 p.latency_ms, int(p.mitm_clean),
+                 p.latency_ms, int(p.mitm_clean), int(p.alive),
                  now)
                 for p in proxies
             ],
@@ -175,6 +180,55 @@ def save_proxies_to_cache(proxies: List["Proxy"]) -> None:
         conn.close()
     except Exception:
         pass
+
+
+def get_cache_stats(ttl: int = CACHE_TTL) -> dict:
+    """
+    Return per-category proxy counts from the DB (non-expired entries only).
+
+    Categories:
+      verified_clean — alive=1, mitm_clean=1, latency_ms > 0  (chain-tested and clean)
+      mitm           — mitm_clean=0                             (MITM cert mismatch)
+      dead           — alive=0                                  (tested and unreachable)
+      geo_only       — alive=1, latency_ms <= 0                 (geolocated, never chain-tested)
+    """
+    try:
+        conn = _get_conn()
+        cutoff = time.time() - ttl
+        row = conn.execute(
+            """SELECT
+                   COUNT(*)                                                         AS total,
+                   SUM(CASE WHEN alive=1 AND mitm_clean=1 AND latency_ms > 0
+                            THEN 1 ELSE 0 END)                                     AS verified_clean,
+                   SUM(CASE WHEN mitm_clean=0                THEN 1 ELSE 0 END)    AS mitm,
+                   SUM(CASE WHEN alive=0                     THEN 1 ELSE 0 END)    AS dead,
+                   SUM(CASE WHEN alive=1 AND latency_ms <= 0 THEN 1 ELSE 0 END)    AS geo_only
+               FROM proxies
+               WHERE checked_at > ?""",
+            (cutoff,),
+        ).fetchone()
+        conn.close()
+        total    = row[0] or 0
+        clean    = row[1] or 0
+        mitm     = row[2] or 0
+        dead     = row[3] or 0
+        geo_only = row[4] or 0
+        return {
+            "total":          total,
+            "verified_clean": clean,
+            "mitm":           mitm,
+            "dead":           dead,
+            "geo_only":       geo_only,
+            "pct_clean":      round(100 * clean    / total, 1) if total else 0,
+            "pct_mitm":       round(100 * mitm     / total, 1) if total else 0,
+            "pct_dead":       round(100 * dead     / total, 1) if total else 0,
+            "pct_geo_only":   round(100 * geo_only / total, 1) if total else 0,
+        }
+    except Exception:
+        return {
+            "total": 0, "verified_clean": 0, "mitm": 0, "dead": 0, "geo_only": 0,
+            "pct_clean": 0, "pct_mitm": 0, "pct_dead": 0, "pct_geo_only": 0,
+        }
 
 
 def clear_cache() -> None:

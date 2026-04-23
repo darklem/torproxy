@@ -24,6 +24,7 @@ import socks  # PySocks
 from rich.console import Console
 from rich.panel import Panel
 from proxy_scraper import Proxy
+from proxy_cache import get_cache_stats
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -294,6 +295,8 @@ tr:hover td{background:#1c2128}
 </style></head><body>
 <h1><span id="dot"></span>⛓️ TorProxy-Chain Admin</h1>
 <div id="status-card" class="card"></div>
+<div id="startup-card" class="card"></div>
+<div id="db-card" class="card"></div>
 <div id="mitm-card" class="card"></div>
 <div class="card">
   <h2>Proxy Pool</h2>
@@ -308,6 +311,9 @@ function fmtTime(iso){return iso?new Date(iso).toLocaleTimeString():'—'}
 async function refresh(){
   try{
     const[st,pool]=await Promise.all([fetch('/status').then(r=>r.json()),fetch('/pool').then(r=>r.json())]);
+    document.getElementById('dot').style.background='#3fb950';
+
+    // ── Current proxy + server stats ─────────────────────────────────────────
     document.getElementById('status-card').innerHTML=`
       <h2>Current Proxy</h2>
       <div class="stat"><div class="stat-label">Address</div><div class="stat-value blue">${st.active_proxy}</div></div>
@@ -323,6 +329,30 @@ async function refresh(){
       <div class="stat"><div class="stat-label">Last rotation</div><div class="stat-value">${fmtTime(st.last_rotation)}</div></div>
       <div class="stat"><div class="stat-label">Reason</div><div class="stat-value">${st.last_rotation_reason||'—'}</div></div>
       <div class="stat"><div class="stat-label">Watchdog</div><div class="stat-value dim">every ${st.watchdog_interval_s}s</div></div>`;
+
+    // ── Startup summary ───────────────────────────────────────────────────────
+    const ss=st.startup_summary;
+    document.getElementById('startup-card').innerHTML=ss?`
+      <h2>Loading State <span class="dim" style="font-size:.7rem;font-weight:normal">${fmtTime(ss.at)}</span></h2>
+      <div class="stat"><div class="stat-label">Scraped</div><div class="stat-value">${ss.scraped}</div></div>
+      <div class="stat"><div class="stat-label">Geolocated</div><div class="stat-value">${ss.geolocated}</div></div>
+      <div class="stat"><div class="stat-label">Tested</div><div class="stat-value">${ss.tested}</div></div>
+      <div class="stat"><div class="stat-label">Clean</div><div class="stat-value green">${ss.clean}</div></div>
+      <div class="stat"><div class="stat-label">MITM</div><div class="stat-value ${ss.mitm>0?'red':'green'}">${ss.mitm}</div></div>
+      <div class="stat"><div class="stat-label">Dead (HS)</div><div class="stat-value ${ss.dead>0?'yellow':'green'}">${ss.dead}</div></div>`
+    :`<h2>Loading State</h2><div class="dim" style="font-size:.82rem;padding-top:4px">Not available yet</div>`;
+
+    // ── DB stats ─────────────────────────────────────────────────────────────
+    const db=st.db_stats||{};
+    document.getElementById('db-card').innerHTML=`
+      <h2>Proxy Database <span class="dim" style="font-size:.7rem;font-weight:normal">(last 24 h)</span></h2>
+      <div class="stat"><div class="stat-label">Total</div><div class="stat-value blue">${db.total||0}</div></div>
+      <div class="stat"><div class="stat-label">Verified clean</div><div class="stat-value green">${db.verified_clean||0} <span class="dim">${db.pct_clean||0}%</span></div></div>
+      <div class="stat"><div class="stat-label">MITM detected</div><div class="stat-value ${(db.mitm||0)>0?'red':'green'}">${db.mitm||0} <span class="dim">${db.pct_mitm||0}%</span></div></div>
+      <div class="stat"><div class="stat-label">Dead (HS)</div><div class="stat-value ${(db.dead||0)>0?'yellow':'green'}">${db.dead||0} <span class="dim">${db.pct_dead||0}%</span></div></div>
+      <div class="stat"><div class="stat-label">Geo-only</div><div class="stat-value dim">${db.geo_only||0} <span class="dim">${db.pct_geo_only||0}%</span></div></div>`;
+
+    // ── MITM ─────────────────────────────────────────────────────────────────
     const mv=st.mitm_verdict;
     const mvcol=mv==='pass'?'green':mv==='warn'?'yellow':mv==='fail'?'red':'dim';
     const mvlabel=mv==='unknown'?'not checked yet':mv.toUpperCase();
@@ -334,8 +364,9 @@ async function refresh(){
       <h2>MITM Detection</h2>
       <div class="stat"><div class="stat-label">Verdict</div><div class="stat-value ${mvcol}">${mvlabel}</div></div>
       <div class="stat"><div class="stat-label">Verified at</div><div class="stat-value">${fmtTime(st.mitm_last_check)}</div></div>
-      ${checkRows?`<br><br><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>${checkRows}</tbody></table>`:''}
-    `;
+      ${checkRows?`<br><br><table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>${checkRows}</tbody></table>`:''}`;
+
+    // ── Pool table ────────────────────────────────────────────────────────────
     const rows=pool.map(p=>`<tr class="${p.active?'active-row':''}">
       <td class="dim">${p.index}</td>
       <td class="${p.active?'green':''}">${p.address}</td>
@@ -406,6 +437,9 @@ class ProxyChainServer:
         self._mitm_verdict: str = "unknown"
         self._mitm_last_check: Optional[datetime.datetime] = None
         self._mitm_checks: List[dict] = []
+
+        # Startup summary (set by main.py after pool build)
+        self._startup_summary: Optional[dict] = None
 
         self._server_sock: Optional[socket.socket] = None
         self._running = False
@@ -596,6 +630,7 @@ class ProxyChainServer:
             mitm_verdict = self._mitm_verdict
             mitm_last = self._mitm_last_check
             mitm_checks = list(self._mitm_checks)
+            startup_summary = self._startup_summary
         return {
             "active_proxy": proxy.address,
             "country": proxy.country or "??",
@@ -613,6 +648,8 @@ class ProxyChainServer:
             "mitm_verdict": mitm_verdict,
             "mitm_last_check": mitm_last.isoformat() + "Z" if mitm_last else None,
             "mitm_checks": mitm_checks,
+            "db_stats": get_cache_stats(),
+            "startup_summary": startup_summary,
         }
 
     def _get_pool(self) -> list:
@@ -707,6 +744,30 @@ class ProxyChainServer:
             self._mitm_verdict = verdict
             self._mitm_last_check = datetime.datetime.utcnow()
             self._mitm_checks = checks
+
+    def set_startup_summary(
+        self,
+        scraped: int,
+        geolocated: int,
+        tested: int,
+        clean: int,
+        mitm: int,
+        dead: int,
+    ):
+        """
+        Record what was loaded at startup for the web admin UI.
+        Called once from main.py after the proxy pool is fully built.
+        """
+        with self._lock:
+            self._startup_summary = {
+                "scraped":    scraped,
+                "geolocated": geolocated,
+                "tested":     tested,
+                "clean":      clean,
+                "mitm":       mitm,
+                "dead":       dead,
+                "at":         datetime.datetime.utcnow().isoformat() + "Z",
+            }
 
     def swap_exit_proxy(self, new_proxy: Proxy):
         """Hot-swap the exit proxy without restarting the server."""

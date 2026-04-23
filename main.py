@@ -345,6 +345,9 @@ def run(
         resolve_countries_batch(need_resolve, via_tor_port=active_tor_port)
         newly_resolved = [p for p in need_resolve if p.country and (p.host, p.port) not in cache_map]
         if newly_resolved:
+            # Geo-only entries: alive=True (not tested, not dead — just unverified).
+            for p in newly_resolved:
+                p.alive = True
             save_proxies_to_cache(newly_resolved)
             console.print(f"[dim]  Cached {len(newly_resolved)} geolocation entries.[/dim]")
     else:
@@ -415,10 +418,15 @@ def run(
         tor.stop()
         sys.exit(1)
 
+    _n_tested = 0
+    _n_mitm_dead = 0
+    _n_mitm_dirty = 0
+
     if not skip_verify:
         console.print("[cyan]Verifying proxies through full chain (Tor → proxy → ipconfig.io)...[/cyan]")
+        tested_batch = candidates[:200]
         all_alive = check_proxies(
-            candidates[:200],
+            tested_batch,
             via_tor_port=active_tor_port,
             max_workers=20,
         )
@@ -426,14 +434,24 @@ def run(
         mitm_clean = [p for p in all_alive if p.mitm_clean]
         mitm_dirty = [p for p in all_alive if not p.mitm_clean]
 
-        # Persist ALL alive proxies — clean and dirty.
-        # Dirty ones are stored so they are not re-tested needlessly;
-        # load_cached_proxies(mitm_clean_only=True) keeps them out of the pool.
-        if all_alive:
-            save_proxies_to_cache(all_alive)
+        # Proxies that were in the batch but didn't respond → mark as dead.
+        alive_keys = {(p.host, p.port) for p in all_alive}
+        dead_proxies = [p for p in tested_batch if (p.host, p.port) not in alive_keys]
+        for p in dead_proxies:
+            p.alive = False
+
+        _n_tested    = len(tested_batch)
+        _n_mitm_dead = len(dead_proxies)
+        _n_mitm_dirty = len(mitm_dirty)
+
+        # Persist alive (clean + dirty) AND dead — all results in one write.
+        to_cache = all_alive + dead_proxies
+        if to_cache:
+            save_proxies_to_cache(to_cache)
             console.print(
-                f"[dim]  Cached {len(all_alive)} proxies "
-                f"({len(mitm_clean)} clean, {len(mitm_dirty)} MITM-dirty).[/dim]"
+                f"[dim]  Cached {len(to_cache)} proxies "
+                f"({len(mitm_clean)} clean, {len(mitm_dirty)} MITM-dirty, "
+                f"{len(dead_proxies)} dead).[/dim]"
             )
 
         if mitm_dirty:
@@ -511,6 +529,17 @@ def run(
 
     # MITM status comes from the pool-build check (no extra connection needed).
     _push_mitm_status(server, server.exit_proxy)
+
+    # Push startup summary to the web admin UI.
+    _n_geolocated = len([p for p in raw_proxies if p.country])
+    server.set_startup_summary(
+        scraped=len(raw_proxies),
+        geolocated=_n_geolocated,
+        tested=_n_tested,
+        clean=len(alive_proxies),
+        mitm=_n_mitm_dirty,
+        dead=_n_mitm_dead,
+    )
 
     # ── Headless mode — block until signal ───────────────────────────────────
     if headless:
