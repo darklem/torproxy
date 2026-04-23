@@ -343,6 +343,16 @@ def run(
     if need_resolve:
         console.print(f"[dim]  Geolocating {len(need_resolve)} proxies via ip-api.com...[/dim]")
         proxies_with_geo = resolve_countries_batch(raw_proxies, via_tor_port=active_tor_port)
+        # Cache geo results so the ip-api.com lookup is skipped on the next run.
+        # These entries carry no MITM verdict yet; mitm_clean defaults to True.
+        # The chain-verification step will overwrite entries with actual results.
+        newly_resolved = [
+            p for p in proxies_with_geo
+            if p.country and (p.host, p.port) not in cache_map
+        ]
+        if newly_resolved:
+            save_proxies_to_cache(newly_resolved)
+            console.print(f"[dim]  Cached {len(newly_resolved)} geolocation entries.[/dim]")
     else:
         proxies_with_geo = raw_proxies
         console.print("[dim]  All proxies already geolocated from cache.[/dim]")
