@@ -7,6 +7,12 @@ Sources are defined in proxy_sources.py — edit that file to add new ones.
 
 import time
 import socket
+import ssl
+import hashlib
+import json as _json
+import struct
+import threading
+import re
 import logging
 import concurrent.futures
 from dataclasses import dataclass, field
@@ -24,7 +30,16 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 PROXY_CHECK_TIMEOUT = 8
+_CHAIN_VERIFY_TIMEOUT = 20   # seconds — longer because Tor + proxy + HTTPS
 MAX_CHECK_WORKERS = 30
+
+_IPCONFIG_HOST = "ipconfig.io"
+_IPCONFIG_PORT = 443
+
+# Module-level baseline TLS cert fingerprint for ipconfig.io (SHA-256 of DER cert).
+# "" = direct fetch failed (skip comparison); None = not yet attempted.
+_ipconfig_baseline: Optional[str] = None
+_ipconfig_baseline_lock = threading.Lock()
 
 
 @dataclass
@@ -39,6 +54,7 @@ class Proxy:
     alive: bool = False
     username: str = ""
     password: str = ""
+    mitm_clean: bool = True     # False if TLS cert mismatch detected during chain verify
 
     @property
     def address(self) -> str:
@@ -186,6 +202,169 @@ def resolve_countries_batch(proxies: List[Proxy], via_tor_port: Optional[int] = 
     return proxies
 
 
+# ── ipconfig.io baseline + full-chain verification ────────────────────────────
+
+def _get_ipconfig_baseline() -> Optional[str]:
+    """
+    Return the SHA-256 fingerprint (hex) of ipconfig.io's TLS cert obtained via a direct
+    connection (no proxy). Result is cached for the process lifetime.
+    Returns None if the direct fetch failed — callers should skip the comparison.
+    """
+    global _ipconfig_baseline
+    with _ipconfig_baseline_lock:
+        if _ipconfig_baseline is not None:
+            return _ipconfig_baseline or None   # "" → None
+        try:
+            ctx = ssl.create_default_context()
+            raw = socket.create_connection((_IPCONFIG_HOST, _IPCONFIG_PORT), timeout=10)
+            tls = ctx.wrap_socket(raw, server_hostname=_IPCONFIG_HOST)
+            cert_der = tls.getpeercert(binary_form=True)
+            tls.close()
+            _ipconfig_baseline = hashlib.sha256(cert_der).hexdigest()
+            logger.debug(f"ipconfig.io baseline TLS fingerprint: {_ipconfig_baseline[:16]}…")
+            return _ipconfig_baseline
+        except Exception as exc:
+            logger.debug(f"ipconfig.io baseline fetch failed: {exc}")
+            _ipconfig_baseline = ""  # sentinel: failed, skip comparison
+            return None
+
+
+def _recv_exact(sock, n: int) -> bytes:
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError(f"socket closed after {len(data)}/{n} bytes")
+        data += chunk
+    return data
+
+
+def _socks5_connect_to(sock, host: str, port: int) -> bool:
+    """Run the SOCKS5 client handshake to reach host:port over an already-open socket."""
+    try:
+        sock.sendall(b"\x05\x01\x00")          # VER=5, 1 method: no-auth
+        if _recv_exact(sock, 2)[1] != 0x00:    # server chose no-auth
+            return False
+        host_b = host.encode("idna")
+        req = (b"\x05\x01\x00\x03"             # VER CMD RSV ATYP=domain
+               + bytes([len(host_b)]) + host_b
+               + struct.pack("!H", port))
+        sock.sendall(req)
+        hdr = _recv_exact(sock, 4)
+        if hdr[1] != 0x00:                     # REP must be 0x00 (success)
+            return False
+        atyp = hdr[3]
+        if atyp == 0x01:
+            _recv_exact(sock, 4 + 2)
+        elif atyp == 0x03:
+            n = _recv_exact(sock, 1)[0]
+            _recv_exact(sock, n + 2)
+        elif atyp == 0x04:
+            _recv_exact(sock, 16 + 2)
+        return True
+    except Exception:
+        return False
+
+
+def _socks4a_connect_to(sock, host: str, port: int) -> bool:
+    """Run the SOCKS4a client handshake to reach host:port over an already-open socket."""
+    try:
+        host_b = host.encode("ascii") + b"\x00"
+        # SOCKS4a: IP 0.0.0.1 signals hostname follows after user-id
+        req = struct.pack("!BBHBBBB", 4, 1, port, 0, 0, 0, 1) + b"\x00" + host_b
+        sock.sendall(req)
+        resp = _recv_exact(sock, 8)
+        return resp[1] == 0x5A                 # 0x5A = request granted
+    except Exception:
+        return False
+
+
+def _verify_via_chain(proxy: Proxy, tor_port: int) -> Proxy:
+    """
+    Full chain verification: Tor → exit-proxy → ipconfig.io:443 (HTTPS).
+
+    On success:
+      - proxy.alive = True
+      - proxy.latency_ms set
+      - proxy.country / country_name set from ipconfig.io JSON response
+      - proxy.mitm_clean = False if TLS cert differs from the direct baseline
+
+    On any failure:
+      - proxy.alive = False
+    """
+    start = time.monotonic()
+    try:
+        # 1. Connect to exit proxy through Tor
+        s = socks.socksocket()
+        s.set_proxy(socks.SOCKS5, "127.0.0.1", tor_port)
+        s.settimeout(_CHAIN_VERIFY_TIMEOUT)
+        s.connect((proxy.host, proxy.port))
+
+        # 2. SOCKS handshake: exit proxy → ipconfig.io:443
+        if proxy.proto == "socks5":
+            ok = _socks5_connect_to(s, _IPCONFIG_HOST, _IPCONFIG_PORT)
+        else:
+            ok = _socks4a_connect_to(s, _IPCONFIG_HOST, _IPCONFIG_PORT)
+
+        if not ok:
+            proxy.alive = False
+            return proxy
+
+        # 3. TLS — verify cert against direct baseline
+        ctx = ssl.create_default_context()
+        tls = ctx.wrap_socket(s, server_hostname=_IPCONFIG_HOST)
+
+        cert_der = tls.getpeercert(binary_form=True)
+        fp = hashlib.sha256(cert_der).hexdigest()
+        baseline = _get_ipconfig_baseline()
+        if baseline and fp != baseline:
+            proxy.mitm_clean = False
+            logger.warning(
+                f"MITM cert mismatch on {proxy.address}: "
+                f"got {fp[:16]}… expected {baseline[:16]}…"
+            )
+
+        # 4. HTTP GET /json
+        tls.sendall(
+            f"GET /json HTTP/1.1\r\n"
+            f"Host: {_IPCONFIG_HOST}\r\n"
+            f"Accept: application/json\r\n"
+            f"Connection: close\r\n\r\n".encode()
+        )
+
+        data = b""
+        tls.settimeout(_CHAIN_VERIFY_TIMEOUT)
+        while len(data) < 16384:
+            try:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            except (ssl.SSLError, OSError):
+                break
+        tls.close()
+
+        # 5. Parse JSON from response body
+        m = re.search(rb'\{[^{}]+\}', data)
+        if m:
+            info = _json.loads(m.group().decode("utf-8", errors="ignore"))
+            cc = info.get("country_code", "")
+            if isinstance(cc, str) and len(cc) >= 2:
+                proxy.country = cc[:2].upper()
+            cn = info.get("country", "")
+            if isinstance(cn, str):
+                proxy.country_name = cn
+
+        proxy.latency_ms = (time.monotonic() - start) * 1000
+        proxy.alive = True
+
+    except Exception as exc:
+        logger.debug(f"_verify_via_chain({proxy.address}): {exc}")
+        proxy.alive = False
+
+    return proxy
+
+
 # ── Proxy liveness check ──────────────────────────────────────────────────────
 
 def _check_proxy(proxy: Proxy, via_tor_port: Optional[int] = None) -> Proxy:
@@ -222,7 +401,22 @@ def check_proxies(
     max_workers: int = MAX_CHECK_WORKERS,
     show_progress: bool = True,
 ) -> List[Proxy]:
-    """Check all proxies in parallel and return the alive ones sorted by latency."""
+    """
+    Check all proxies in parallel and return the alive ones sorted by latency.
+
+    When via_tor_port is set, performs full chain verification:
+    Tor → exit proxy → ipconfig.io:443 (HTTPS).  This sets country/country_name
+    from the real exit IP and mitm_clean from TLS cert comparison.
+    """
+    if via_tor_port:
+        # Pre-fetch the direct baseline once before spawning workers
+        _get_ipconfig_baseline()
+        check_fn = lambda p: _verify_via_chain(p, via_tor_port)
+        desc = f"[cyan]Verifying {len(proxies)} proxies via full chain (ipconfig.io)...[/cyan]"
+    else:
+        check_fn = lambda p: _check_proxy(p)
+        desc = f"[cyan]Checking {len(proxies)} proxies...[/cyan]"
+
     results = []
 
     if show_progress:
@@ -233,21 +427,15 @@ def check_proxies(
             TaskProgressColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task(
-                f"[cyan]Checking {len(proxies)} proxies...[/cyan]",
-                total=len(proxies),
-            )
+            task = progress.add_task(desc, total=len(proxies))
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(_check_proxy, p, via_tor_port): p
-                    for p in proxies
-                }
+                futures = {executor.submit(check_fn, p): p for p in proxies}
                 for future in concurrent.futures.as_completed(futures):
                     results.append(future.result())
                     progress.advance(task)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(lambda p: _check_proxy(p, via_tor_port), proxies))
+            results = list(executor.map(check_fn, proxies))
 
     alive = [p for p in results if p.alive]
     return sorted(alive, key=lambda p: p.latency_ms)

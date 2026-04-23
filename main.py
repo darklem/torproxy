@@ -392,13 +392,6 @@ def run(
     if need_resolve:
         console.print(f"[dim]  Geolocating {len(need_resolve)} proxies via ip-api.com...[/dim]")
         proxies_with_geo = resolve_countries_batch(raw_proxies, via_tor_port=active_tor_port)
-        newly_resolved = [
-            p for p in proxies_with_geo
-            if p.country and (p.host, p.port) not in cache_map
-        ]
-        if newly_resolved:
-            save_proxies_to_cache(newly_resolved)
-            console.print(f"[dim]  Cached {len(newly_resolved)} new geolocation entries.[/dim]")
     else:
         proxies_with_geo = raw_proxies
         console.print("[dim]  All proxies already geolocated from cache.[/dim]")
@@ -467,12 +460,40 @@ def run(
         sys.exit(1)
 
     if not skip_verify:
-        console.print("[cyan]Checking proxies through Tor...[/cyan]")
-        alive_proxies = check_proxies(
+        console.print("[cyan]Verifying proxies through full chain (Tor → proxy → ipconfig.io)...[/cyan]")
+        all_alive = check_proxies(
             candidates[:200],
             via_tor_port=active_tor_port,
             max_workers=20,
         )
+
+        mitm_clean = [p for p in all_alive if p.mitm_clean]
+        mitm_dirty_count = len(all_alive) - len(mitm_clean)
+
+        if mitm_dirty_count:
+            console.print(
+                f"[yellow]  {mitm_dirty_count} proxies excluded "
+                f"(TLS cert mismatch — MITM suspected)[/yellow]"
+            )
+
+        # Only save MITM-clean proxies to the persistent cache
+        if mitm_clean:
+            save_proxies_to_cache(mitm_clean)
+            console.print(
+                f"[dim]  Cached {len(mitm_clean)} MITM-clean proxies "
+                f"(geolocation from ipconfig.io).[/dim]"
+            )
+
+        if mitm_clean:
+            alive_proxies = mitm_clean
+        elif all_alive:
+            console.print(
+                "[yellow]  No MITM-clean proxies found — "
+                "proceeding with best available (not ideal).[/yellow]"
+            )
+            alive_proxies = all_alive
+        else:
+            alive_proxies = []
     else:
         alive_proxies = candidates
 
