@@ -19,7 +19,7 @@ services:
     image: mitmproxy/mitmproxy:latest
     command: >
       mitmdump
-      --mode upstream:socks5h://torproxy:10800
+      --mode upstream:socks5://torproxy:10800
       --listen-port 8080
       --listen-host 0.0.0.0
       --set ssl_insecure=true
