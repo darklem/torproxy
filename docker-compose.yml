@@ -15,5 +15,25 @@ services:
       # TORPROXY_FAIL_THRESHOLD: "3"
     restart: unless-stopped
 
+  mitm:
+    image: mitmproxy/mitmproxy:latest
+    command: >
+      mitmdump
+      --mode upstream:socks5h://torproxy:10800
+      --listen-port 8080
+      --listen-host 0.0.0.0
+      --set ssl_insecure=true
+      --scripts /mitm_proxy/addon.py
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./mitm_proxy:/mitm_proxy:ro
+      - ./heuristics.yml:/heuristics.yml:ro
+      - mitm-certs:/root/.mitmproxy
+    depends_on:
+      - torproxy
+    restart: unless-stopped
+
 volumes:
   torproxy-cache:
+  mitm-certs:

@@ -301,6 +301,7 @@ tr:hover td{background:#1c2128}
 <nav class="nav"><a href="/" class="nav-link nav-active">Dashboard</a><a href="/database" class="nav-link">Database</a></nav>
 <div id="status-card" class="card"></div>
 <div id="mitm-card" class="card"></div>
+<div id="mitm-events-card" class="card"><h2>MITM Proxy Events</h2><div class="dim" style="font-size:.82rem">No events yet.</div></div>
 <div class="card">
   <h2>Proxy Pool</h2>
   <div class="toolbar">
@@ -311,6 +312,20 @@ tr:hover td{background:#1c2128}
 <script>
 function fmtUptime(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;return(h?h+'h ':'')+m+'m '+sec+'s'}
 function fmtTime(iso){return iso?new Date(iso).toLocaleTimeString():'—'}
+async function refreshMitmEvents(){
+  try{
+    const evts=await fetch('/mitm/events').then(r=>r.json());
+    const card=document.getElementById('mitm-events-card');
+    if(!evts||evts.length===0){card.innerHTML='<h2>MITM Proxy Events</h2><div class="dim" style="font-size:.82rem">No events yet.</div>';return;}
+    const recent=evts.slice(-20).reverse();
+    const rows=recent.map(e=>{
+      const t=new Date(e.ts*1000).toLocaleTimeString();
+      const acol=e.action==='rotate'?'yellow':e.action==='block'?'red':'dim';
+      return `<tr><td class="dim">${t}</td><td class="blue">${e.host}</td><td>${e.reason}</td><td class="${acol}">${e.action}</td></tr>`;
+    }).join('');
+    card.innerHTML=`<h2>MITM Proxy Events <span class="dim" style="font-size:.7rem;font-weight:normal">(last 20)</span></h2><table><thead><tr><th>Time</th><th>Host</th><th>Reason</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }catch(e){}
+}
 async function refresh(){
   try{
     const[st,pool]=await Promise.all([fetch('/status').then(r=>r.json()),fetch('/pool').then(r=>r.json())]);
@@ -364,7 +379,7 @@ async function refresh(){
 }
 async function rotate(){await fetch('/rotate',{method:'POST'});setTimeout(refresh,800)}
 async function useProxy(n){await fetch('/proxy/'+n,{method:'POST'});setTimeout(refresh,400)}
-refresh();setInterval(refresh,5000);
+refresh();refreshMitmEvents();setInterval(refresh,5000);setInterval(refreshMitmEvents,5000);
 </script></body></html>"""
 
 
@@ -505,6 +520,10 @@ class ProxyChainServer:
         # Rescrape callback (set by main.py; called by /db/purge)
         self._rescrape_callback: Optional[Callable] = None
         self._rescrape_running: bool = False
+
+        # MITM proxy events ring buffer (filled by POST /mitm/event from mitmproxy addon)
+        self._mitm_events: List[dict] = []
+        self._mitm_events_lock = threading.Lock()
 
         self._server_sock: Optional[socket.socket] = None
         self._running = False
@@ -765,6 +784,23 @@ class ProxyChainServer:
                     self._send_json(server_ref._get_pool())
                 elif self.path == "/db/stats":
                     self._send_json(get_cache_stats())
+                elif self.path == "/mitm/events":
+                    with server_ref._mitm_events_lock:
+                        events = list(server_ref._mitm_events)
+                    self._send_json(events)
+                elif self.path == "/ca":
+                    import pathlib
+                    ca_path = pathlib.Path("/root/.mitmproxy/mitmproxy-ca-cert.pem")
+                    if ca_path.exists():
+                        body = ca_path.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/x-pem-file")
+                        self.send_header("Content-Disposition", 'attachment; filename="mitmproxy-ca-cert.pem"')
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self._send_json({"error": "CA cert not found — start mitm container first"}, 404)
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -773,6 +809,18 @@ class ProxyChainServer:
                 if self.path == "/rotate":
                     server_ref.rotate()
                     self._send_json({"ok": True, "proxy": server_ref.exit_proxy.address})
+                elif self.path == "/mitm/event":
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(length) if length else b"{}"
+                    try:
+                        event = json.loads(body)
+                        with server_ref._mitm_events_lock:
+                            server_ref._mitm_events.append(event)
+                            if len(server_ref._mitm_events) > 200:
+                                server_ref._mitm_events = server_ref._mitm_events[-200:]
+                        self._send_json({"ok": True})
+                    except Exception:
+                        self._send_json({"ok": False}, 400)
                 elif self.path == "/db/purge":
                     server_ref.trigger_rescrape()
                     self._send_json({"ok": True, "status": "rescrape_started"})

@@ -1,0 +1,38 @@
+global:
+  torproxy_api: "http://torproxy:10801"
+  default_action: log   # log | rotate | block
+
+sites:
+
+  "censys.io":
+    - check: rate_limit
+      status_codes: [429, 403]
+      body_keywords: ["quota", "rate limit", "too many"]
+      action: rotate
+
+    - check: redirect
+      pattern: "login|signin|accounts\\."
+      action: rotate
+
+  "shodan.io":
+    - check: rate_limit
+      status_codes: [429]
+      action: rotate
+
+    - check: redirect
+      pattern: "login|signin"
+      action: rotate
+
+  "fofa.info":
+    - check: rate_limit
+      status_codes: [429, 403]
+      action: rotate
+
+  "*":
+    - check: timeout
+      threshold_ms: 30000
+      action: log
+
+    - check: redirect
+      max_chain: 5
+      action: log
