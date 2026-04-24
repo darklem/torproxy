@@ -541,6 +541,73 @@ def run(
         dead=_n_mitm_dead,
     )
 
+    # Register the rescrape callback so the Database page can trigger a full
+    # re-scrape while the SOCKS server keeps running with the current pool.
+    def _do_rescrape():
+        try:
+            console.print("[cyan]Background rescrape started...[/cyan]")
+            new_raw = fetch_all_proxies(verbose=False)
+            if not new_raw:
+                console.print("[yellow]Rescrape: no proxies fetched.[/yellow]")
+                return
+            # Geo
+            fresh_cache = load_cached_proxies()
+            fresh_map = {(p.host, p.port): p for p in fresh_cache}
+            for p in new_raw:
+                cp = fresh_map.get((p.host, p.port))
+                if cp and cp.country:
+                    p.country, p.country_name = cp.country, cp.country_name
+            need = [p for p in new_raw if not p.country]
+            if need:
+                resolve_countries_batch(need, via_tor_port=active_tor_port)
+                newly = [p for p in need if p.country and (p.host, p.port) not in fresh_map]
+                for p in newly:
+                    p.alive = True
+                if newly:
+                    save_proxies_to_cache(newly)
+            # Filter by country
+            if selected_country:
+                cands = filter_by_country(new_raw, selected_country)
+            else:
+                cands = new_raw
+            if not cands:
+                console.print("[yellow]Rescrape: no proxies match the selected country.[/yellow]")
+                return
+            # Verify
+            batch = cands[:200]
+            all_alive_new = check_proxies(batch, via_tor_port=active_tor_port, max_workers=20)
+            mc = [p for p in all_alive_new if p.mitm_clean]
+            md = [p for p in all_alive_new if not p.mitm_clean]
+            alive_keys = {(p.host, p.port) for p in all_alive_new}
+            dead_ps = [p for p in batch if (p.host, p.port) not in alive_keys]
+            for p in dead_ps:
+                p.alive = False
+            if all_alive_new + dead_ps:
+                save_proxies_to_cache(all_alive_new + dead_ps)
+            new_pool = mc or all_alive_new or cands
+            if new_pool:
+                with server._lock:
+                    server._proxy_pool = new_pool
+                    server._proxy_index = 0
+                    server.exit_proxy = new_pool[0]
+                    server._failure_count = 0
+            server.set_startup_summary(
+                scraped=len(new_raw),
+                geolocated=len([p for p in new_raw if p.country]),
+                tested=len(batch),
+                clean=len(mc),
+                mitm=len(md),
+                dead=len(dead_ps),
+            )
+            _push_mitm_status(server, server.exit_proxy)
+            console.print(
+                f"[green]Rescrape complete: [bold]{len(new_pool)}[/bold] proxies in pool.[/green]"
+            )
+        except Exception as e:
+            _log.error(f"Background rescrape error: {e}")
+
+    server.set_rescrape_callback(_do_rescrape)
+
     # ── Headless mode — block until signal ───────────────────────────────────
     if headless:
         console.print("[green]Headless mode active. Proxy running. Send SIGTERM to stop.[/green]")

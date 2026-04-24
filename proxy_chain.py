@@ -24,7 +24,7 @@ import socks  # PySocks
 from rich.console import Console
 from rich.panel import Panel
 from proxy_scraper import Proxy
-from proxy_cache import get_cache_stats
+from proxy_cache import get_cache_stats, clear_cache
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -292,11 +292,14 @@ tr:hover td{background:#1c2128}
 .badge-active{background:#1a4731;color:#3fb950}
 #dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:6px;vertical-align:middle}
 .toolbar{margin-bottom:16px}
+.nav{margin-bottom:20px;border-bottom:1px solid #30363d;padding-bottom:12px}
+.nav-link{color:#8b949e;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:.85rem;margin-right:4px}
+.nav-link:hover{background:#21262d;color:#e6edf3}
+.nav-active{background:#21262d;color:#58a6ff}
 </style></head><body>
 <h1><span id="dot"></span>⛓️ TorProxy-Chain Admin</h1>
+<nav class="nav"><a href="/" class="nav-link nav-active">Dashboard</a><a href="/database" class="nav-link">Database</a></nav>
 <div id="status-card" class="card"></div>
-<div id="startup-card" class="card"></div>
-<div id="db-card" class="card"></div>
 <div id="mitm-card" class="card"></div>
 <div class="card">
   <h2>Proxy Pool</h2>
@@ -330,28 +333,6 @@ async function refresh(){
       <div class="stat"><div class="stat-label">Reason</div><div class="stat-value">${st.last_rotation_reason||'—'}</div></div>
       <div class="stat"><div class="stat-label">Watchdog</div><div class="stat-value dim">every ${st.watchdog_interval_s}s</div></div>`;
 
-    // ── Startup summary ───────────────────────────────────────────────────────
-    const ss=st.startup_summary;
-    document.getElementById('startup-card').innerHTML=ss?`
-      <h2>Loading State <span class="dim" style="font-size:.7rem;font-weight:normal">${fmtTime(ss.at)}</span></h2>
-      <div class="stat"><div class="stat-label">Scraped</div><div class="stat-value">${ss.scraped}</div></div>
-      <div class="stat"><div class="stat-label">Geolocated</div><div class="stat-value">${ss.geolocated}</div></div>
-      <div class="stat"><div class="stat-label">Tested</div><div class="stat-value">${ss.tested}</div></div>
-      <div class="stat"><div class="stat-label">Clean</div><div class="stat-value green">${ss.clean}</div></div>
-      <div class="stat"><div class="stat-label">MITM</div><div class="stat-value ${ss.mitm>0?'red':'green'}">${ss.mitm}</div></div>
-      <div class="stat"><div class="stat-label">Dead (HS)</div><div class="stat-value ${ss.dead>0?'yellow':'green'}">${ss.dead}</div></div>`
-    :`<h2>Loading State</h2><div class="dim" style="font-size:.82rem;padding-top:4px">Not available yet</div>`;
-
-    // ── DB stats ─────────────────────────────────────────────────────────────
-    const db=st.db_stats||{};
-    document.getElementById('db-card').innerHTML=`
-      <h2>Proxy Database <span class="dim" style="font-size:.7rem;font-weight:normal">(last 24 h)</span></h2>
-      <div class="stat"><div class="stat-label">Total</div><div class="stat-value blue">${db.total||0}</div></div>
-      <div class="stat"><div class="stat-label">Verified clean</div><div class="stat-value green">${db.verified_clean||0} <span class="dim">${db.pct_clean||0}%</span></div></div>
-      <div class="stat"><div class="stat-label">MITM detected</div><div class="stat-value ${(db.mitm||0)>0?'red':'green'}">${db.mitm||0} <span class="dim">${db.pct_mitm||0}%</span></div></div>
-      <div class="stat"><div class="stat-label">Dead (HS)</div><div class="stat-value ${(db.dead||0)>0?'yellow':'green'}">${db.dead||0} <span class="dim">${db.pct_dead||0}%</span></div></div>
-      <div class="stat"><div class="stat-label">Geo-only</div><div class="stat-value dim">${db.geo_only||0} <span class="dim">${db.pct_geo_only||0}%</span></div></div>`;
-
     // ── MITM ─────────────────────────────────────────────────────────────────
     const mv=st.mitm_verdict;
     const mvcol=mv==='pass'?'green':mv==='warn'?'yellow':mv==='fail'?'red':'dim';
@@ -384,6 +365,86 @@ async function refresh(){
 async function rotate(){await fetch('/rotate',{method:'POST'});setTimeout(refresh,800)}
 async function useProxy(n){await fetch('/proxy/'+n,{method:'POST'});setTimeout(refresh,400)}
 refresh();setInterval(refresh,5000);
+</script></body></html>"""
+
+
+_DB_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>TorProxy-Chain — Database</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:monospace;padding:24px}
+h1{color:#58a6ff;margin-bottom:24px;font-size:1.4rem}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin-bottom:20px}
+.card h2{color:#8b949e;font-size:.75rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px}
+.stat{display:inline-block;margin-right:24px;margin-bottom:10px;vertical-align:top}
+.stat-label{color:#8b949e;font-size:.7rem;margin-bottom:2px}
+.stat-value{font-size:1rem;font-weight:bold}
+.green{color:#3fb950}.yellow{color:#d29922}.red{color:#f85149}.blue{color:#58a6ff}.dim{color:#8b949e}
+.btn{border:none;border-radius:6px;padding:7px 16px;cursor:pointer;font-family:monospace;font-size:.85rem}
+.btn-red{background:#6e2020;color:#f85149;border:1px solid #6e2020}.btn-red:hover{background:#f85149;color:#fff}
+.btn-red:disabled{opacity:.4;cursor:not-allowed}
+.nav{margin-bottom:20px;border-bottom:1px solid #30363d;padding-bottom:12px}
+.nav-link{color:#8b949e;text-decoration:none;padding:6px 14px;border-radius:6px;font-size:.85rem;margin-right:4px}
+.nav-link:hover{background:#21262d;color:#e6edf3}
+.nav-active{background:#21262d;color:#58a6ff}
+.spinner{display:inline-block;width:11px;height:11px;border:2px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:spin .8s linear infinite;margin-right:7px;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head><body>
+<h1>⛓️ TorProxy-Chain Admin</h1>
+<nav class="nav"><a href="/" class="nav-link">Dashboard</a><a href="/database" class="nav-link nav-active">Database</a></nav>
+
+<div class="card">
+  <h2>Actions</h2>
+  <button id="purge-btn" class="btn btn-red" onclick="purge()">🗑 Purge &amp; Rescrape</button>
+  <div id="action-status" style="margin-top:14px;font-size:.82rem;min-height:20px"></div>
+</div>
+
+<div id="db-card" class="card"><h2>Proxy Database</h2><div class="dim" style="font-size:.82rem">Loading...</div></div>
+<div id="startup-card" class="card"><h2>Loading State</h2><div class="dim" style="font-size:.82rem">Loading...</div></div>
+
+<script>
+function fmtTime(iso){return iso?new Date(iso).toLocaleTimeString():'—'}
+async function refresh(){
+  try{
+    const st=await fetch('/status').then(r=>r.json());
+    const running=!!st.rescrape_running;
+    const btn=document.getElementById('purge-btn');
+    btn.disabled=running;
+    document.getElementById('action-status').innerHTML=running
+      ?'<span class="spinner"></span><span class="blue">Rescrape in progress — pool will update automatically when done.</span>'
+      :'';
+
+    const db=st.db_stats||{};
+    document.getElementById('db-card').innerHTML=`
+      <h2>Proxy Database <span class="dim" style="font-size:.7rem;font-weight:normal">(last 24 h)</span></h2>
+      <div class="stat"><div class="stat-label">Total</div><div class="stat-value blue">${db.total||0}</div></div>
+      <div class="stat"><div class="stat-label">Verified clean</div><div class="stat-value green">${db.verified_clean||0} <span class="dim">${db.pct_clean||0}%</span></div></div>
+      <div class="stat"><div class="stat-label">MITM detected</div><div class="stat-value ${(db.mitm||0)>0?'red':'green'}">${db.mitm||0} <span class="dim">${db.pct_mitm||0}%</span></div></div>
+      <div class="stat"><div class="stat-label">Dead (HS)</div><div class="stat-value ${(db.dead||0)>0?'yellow':'green'}">${db.dead||0} <span class="dim">${db.pct_dead||0}%</span></div></div>
+      <div class="stat"><div class="stat-label">Geo-only</div><div class="stat-value dim">${db.geo_only||0} <span class="dim">${db.pct_geo_only||0}%</span></div></div>`;
+
+    const ss=st.startup_summary;
+    document.getElementById('startup-card').innerHTML=ss?`
+      <h2>Loading State <span class="dim" style="font-size:.7rem;font-weight:normal">${fmtTime(ss.at)}</span></h2>
+      <div class="stat"><div class="stat-label">Scraped</div><div class="stat-value">${ss.scraped}</div></div>
+      <div class="stat"><div class="stat-label">Geolocated</div><div class="stat-value">${ss.geolocated}</div></div>
+      <div class="stat"><div class="stat-label">Tested</div><div class="stat-value">${ss.tested}</div></div>
+      <div class="stat"><div class="stat-label">Clean</div><div class="stat-value green">${ss.clean}</div></div>
+      <div class="stat"><div class="stat-label">MITM</div><div class="stat-value ${ss.mitm>0?'red':'green'}">${ss.mitm}</div></div>
+      <div class="stat"><div class="stat-label">Dead (HS)</div><div class="stat-value ${ss.dead>0?'yellow':'green'}">${ss.dead}</div></div>`
+    :`<h2>Loading State</h2><div class="dim" style="font-size:.82rem;padding-top:4px">Not available yet</div>`;
+  }catch(e){console.error(e)}
+}
+async function purge(){
+  if(!confirm('Purge the proxy database and trigger a full rescrape?\\nThe server will keep running with the current pool during rescrape.'))return;
+  document.getElementById('purge-btn').disabled=true;
+  document.getElementById('action-status').innerHTML='<span class="spinner"></span><span class="blue">Starting rescrape...</span>';
+  await fetch('/db/purge',{method:'POST'});
+  setTimeout(refresh,600);
+}
+refresh();setInterval(refresh,3000);
 </script></body></html>"""
 
 
@@ -440,6 +501,10 @@ class ProxyChainServer:
 
         # Startup summary (set by main.py after pool build)
         self._startup_summary: Optional[dict] = None
+
+        # Rescrape callback (set by main.py; called by /db/purge)
+        self._rescrape_callback: Optional[Callable] = None
+        self._rescrape_running: bool = False
 
         self._server_sock: Optional[socket.socket] = None
         self._running = False
@@ -650,6 +715,7 @@ class ProxyChainServer:
             "mitm_checks": mitm_checks,
             "db_stats": get_cache_stats(),
             "startup_summary": startup_summary,
+            "rescrape_running": self._rescrape_running,
         }
 
     def _get_pool(self) -> list:
@@ -670,7 +736,14 @@ class ProxyChainServer:
 
     def _status_server_loop(self):
         server_ref = self
-        _HTML = _ADMIN_HTML  # module-level constant
+
+        def _serve_html(handler, html: str):
+            body = html.encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
 
         class _Handler(BaseHTTPRequestHandler):
             def _send_json(self, data, status=200):
@@ -683,16 +756,15 @@ class ProxyChainServer:
 
             def do_GET(self):
                 if self.path in ("/", "/index.html"):
-                    body = _HTML.encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    _serve_html(self, _ADMIN_HTML)
+                elif self.path == "/database":
+                    _serve_html(self, _DB_HTML)
                 elif self.path == "/status":
                     self._send_json(server_ref._get_status())
                 elif self.path == "/pool":
                     self._send_json(server_ref._get_pool())
+                elif self.path == "/db/stats":
+                    self._send_json(get_cache_stats())
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -701,6 +773,9 @@ class ProxyChainServer:
                 if self.path == "/rotate":
                     server_ref.rotate()
                     self._send_json({"ok": True, "proxy": server_ref.exit_proxy.address})
+                elif self.path == "/db/purge":
+                    server_ref.trigger_rescrape()
+                    self._send_json({"ok": True, "status": "rescrape_started"})
                 elif self.path.startswith("/proxy/"):
                     try:
                         idx = int(self.path.split("/proxy/")[1])
@@ -744,6 +819,28 @@ class ProxyChainServer:
             self._mitm_verdict = verdict
             self._mitm_last_check = datetime.datetime.utcnow()
             self._mitm_checks = checks
+
+    def set_rescrape_callback(self, callback: Callable):
+        """Register the callback that re-runs the scraping pipeline (called by /db/purge)."""
+        self._rescrape_callback = callback
+
+    def trigger_rescrape(self):
+        """Clear the proxy DB and run the scraping pipeline in a background thread."""
+        with self._lock:
+            if self._rescrape_running or not self._rescrape_callback:
+                return
+            self._rescrape_running = True
+        threading.Thread(target=self._run_rescrape, daemon=True).start()
+
+    def _run_rescrape(self):
+        try:
+            clear_cache()
+            self._rescrape_callback()
+        except Exception as e:
+            logger.error(f"Background rescrape failed: {e}")
+        finally:
+            with self._lock:
+                self._rescrape_running = False
 
     def set_startup_summary(
         self,
