@@ -102,7 +102,7 @@ class CertServer:
                     else:
                         self.send_response(503)
                         self.end_headers()
-                        self.wfile.write(b"Cert not ready yet — wait a few seconds and retry")
+                        self.wfile.write(b"Cert not ready yet - wait a few seconds and retry")
                 else:
                     self.send_response(404)
                     self.end_headers()
