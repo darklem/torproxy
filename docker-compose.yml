@@ -13,6 +13,7 @@ services:
       # TORPROXY_COUNTRY: "FR"
       # TORPROXY_WATCHDOG_INTERVAL: "30"
       # TORPROXY_FAIL_THRESHOLD: "3"
+      # TORPROXY_ROTATE_EVERY: "100"
     restart: unless-stopped
 
 volumes:

@@ -331,7 +331,8 @@ async function refresh(){
       <br><br>
       <div class="stat"><div class="stat-label">Last rotation</div><div class="stat-value">${fmtTime(st.last_rotation)}</div></div>
       <div class="stat"><div class="stat-label">Reason</div><div class="stat-value">${st.last_rotation_reason||'—'}</div></div>
-      <div class="stat"><div class="stat-label">Watchdog</div><div class="stat-value dim">every ${st.watchdog_interval_s}s</div></div>`;
+      <div class="stat"><div class="stat-label">Watchdog</div><div class="stat-value dim">every ${st.watchdog_interval_s}s</div></div>
+      ${st.rotate_every>0?`<div class="stat"><div class="stat-label">Req. rotation</div><div class="stat-value">${st.requests_since_rotation} / ${st.rotate_every}</div></div>`:''}`;
 
     // ── MITM ─────────────────────────────────────────────────────────────────
     const mv=st.mitm_verdict;
@@ -469,6 +470,7 @@ class ProxyChainServer:
         fail_threshold: int = 3,
         trigger_hosts: Optional[Set[str]] = None,
         status_port: Optional[int] = None,
+        rotate_every: int = 0,
     ):
         self.exit_proxy = exit_proxy
         self.tor_port = tor_port
@@ -483,6 +485,8 @@ class ProxyChainServer:
         self._failure_count: int = 0
         self._watchdog_interval = watchdog_interval
         self._fail_threshold = fail_threshold
+        self._rotate_every = rotate_every
+        self._requests_since_rotation: int = 0
 
         self._lock = threading.Lock()
         self._rotation_in_progress = False
@@ -555,6 +559,15 @@ class ProxyChainServer:
                 client_sock, _ = self._server_sock.accept()
                 with self._lock:
                     self._connections_accepted += 1
+                    self._requests_since_rotation += 1
+                    should_rotate = (
+                        self._rotate_every > 0
+                        and self._requests_since_rotation >= self._rotate_every
+                    )
+                if should_rotate:
+                    threading.Thread(
+                        target=self._auto_rotate, args=("request-count",), daemon=True
+                    ).start()
                 _ClientHandler(
                     client_sock=client_sock,
                     tor_port=self.tor_port,
@@ -625,6 +638,7 @@ class ProxyChainServer:
             new_proxy = self._proxy_pool[self._proxy_index]
             self.exit_proxy = new_proxy
             self._failure_count = 0
+            self._requests_since_rotation = 0
             self._last_rotation_time = datetime.datetime.utcnow()
             self._last_rotation_reason = reason
 
@@ -696,6 +710,7 @@ class ProxyChainServer:
             mitm_last = self._mitm_last_check
             mitm_checks = list(self._mitm_checks)
             startup_summary = self._startup_summary
+            requests_since_rotation = self._requests_since_rotation
         return {
             "active_proxy": proxy.address,
             "country": proxy.country or "??",
@@ -716,6 +731,8 @@ class ProxyChainServer:
             "db_stats": get_cache_stats(),
             "startup_summary": startup_summary,
             "rescrape_running": self._rescrape_running,
+            "rotate_every": self._rotate_every,
+            "requests_since_rotation": requests_since_rotation,
         }
 
     def _get_pool(self) -> list:
