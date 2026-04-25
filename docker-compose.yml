@@ -6,6 +6,7 @@ services:
       - "10801:10801"
     volumes:
       - torproxy-cache:/root/.torproxy-chain
+      - mitm-certs:/root/.mitmproxy:ro
     environment:
       TORPROXY_HEADLESS: "1"
       TORPROXY_STATUS_PORT: "10801"

@@ -301,7 +301,10 @@ tr:hover td{background:#1c2128}
 <nav class="nav"><a href="/" class="nav-link nav-active">Dashboard</a><a href="/database" class="nav-link">Database</a></nav>
 <div id="status-card" class="card"></div>
 <div id="mitm-card" class="card"></div>
-<div id="mitm-events-card" class="card"><h2>MITM Proxy Events</h2><div class="dim" style="font-size:.82rem">No events yet.</div></div>
+<div id="mitm-events-card" class="card">
+  <h2>MITM Proxy Events <a href="/ca" download="mitmproxy-ca.cer" class="btn btn-ghost" style="float:right;text-decoration:none;font-size:.75rem;padding:4px 12px">⬇ Download CA (.cer)</a></h2>
+  <div class="dim" style="font-size:.82rem">No events yet.</div>
+</div>
 <div class="card">
   <h2>Proxy Pool</h2>
   <div class="toolbar">
@@ -790,12 +793,12 @@ class ProxyChainServer:
                     self._send_json(events)
                 elif self.path == "/ca":
                     import pathlib
-                    ca_path = pathlib.Path("/root/.mitmproxy/mitmproxy-ca-cert.pem")
+                    ca_path = pathlib.Path("/root/.mitmproxy/mitmproxy-ca-cert.cer")
                     if ca_path.exists():
                         body = ca_path.read_bytes()
                         self.send_response(200)
-                        self.send_header("Content-Type", "application/x-pem-file")
-                        self.send_header("Content-Disposition", 'attachment; filename="mitmproxy-ca-cert.pem"')
+                        self.send_header("Content-Type", "application/x-x509-ca-cert")
+                        self.send_header("Content-Disposition", 'attachment; filename="mitmproxy-ca.cer"')
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
