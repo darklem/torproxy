@@ -85,8 +85,11 @@ class CertServer:
         import threading
         import http.server
         import pathlib
+        from mitmproxy import ctx
 
-        cert_file = pathlib.Path("/root/.mitmproxy/mitmproxy-ca-cert.pem")
+        confdir = pathlib.Path(ctx.options.confdir).expanduser().resolve()
+        cert_file = confdir / "mitmproxy-ca-cert.pem"
+        log.info(f"CA cert path: {cert_file} (exists: {cert_file.exists()})")
 
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
