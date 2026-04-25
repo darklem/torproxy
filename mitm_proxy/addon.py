@@ -78,4 +78,43 @@ class TorProxyAddon:
             pass
 
 
-addons = [TorProxyAddon()]
+class CertServer:
+    """Tiny HTTP server that serves the mitmproxy CA cert on port 8081."""
+
+    def running(self):
+        import threading
+        import http.server
+        import pathlib
+
+        cert_file = pathlib.Path("/root/.mitmproxy/mitmproxy-ca-cert.pem")
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path in ("/", "/ca"):
+                    if cert_file.exists():
+                        body = cert_file.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/x-x509-ca-cert")
+                        self.send_header("Content-Disposition", 'attachment; filename="mitmproxy-ca.pem"')
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        self.send_response(503)
+                        self.end_headers()
+                        self.wfile.write(b"Cert not ready yet — wait a few seconds and retry")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        def _serve():
+            http.server.HTTPServer(("0.0.0.0", 8081), _Handler).serve_forever()
+
+        threading.Thread(target=_serve, daemon=True).start()
+        log.info("CA cert server listening on :8081/ca")
+
+
+addons = [TorProxyAddon(), CertServer()]

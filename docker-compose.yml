@@ -7,7 +7,6 @@ services:
       - "10802:10802"
     volumes:
       - torproxy-cache:/root/.torproxy-chain
-      - mitm-certs:/root/.mitmproxy:ro
     environment:
       TORPROXY_HEADLESS: "1"
       TORPROXY_STATUS_PORT: "10801"
@@ -30,6 +29,7 @@ services:
       --scripts /mitm_proxy/addon.py
     ports:
       - "8080:8080"
+      - "8081:8081"
     volumes:
       - ./mitm_proxy:/mitm_proxy:ro
       - ./heuristics.yml:/heuristics.yml:ro
