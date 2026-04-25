@@ -18,7 +18,9 @@ services:
     restart: unless-stopped
 
   mitm:
-    image: mitmproxy/mitmproxy:latest
+    build:
+      context: ./mitm_proxy
+      dockerfile: Dockerfile
     command: >
       mitmdump
       --mode upstream:http://torproxy:10802
