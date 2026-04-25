@@ -512,6 +512,22 @@ def check_proxies(
         desc = f"[cyan]Checking {len(proxies)} proxies...[/cyan]"
 
     results = []
+    total = len(proxies)
+    _done = 0
+    _alive = 0
+    _lock = threading.Lock()
+
+    def _run(p):
+        nonlocal _done, _alive
+        result = check_fn(p)
+        with _lock:
+            _done += 1
+            if result.alive:
+                _alive += 1
+            done_snap, alive_snap = _done, _alive
+        if done_snap % 10 == 0 or done_snap == total:
+            logger.info(f"Tested {done_snap}/{total} — {alive_snap} alive")
+        return result
 
     if show_progress:
         with Progress(
@@ -521,15 +537,15 @@ def check_proxies(
             TaskProgressColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task(desc, total=len(proxies))
+            task = progress.add_task(desc, total=total)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(check_fn, p): p for p in proxies}
+                futures = {executor.submit(_run, p): p for p in proxies}
                 for future in concurrent.futures.as_completed(futures):
                     results.append(future.result())
                     progress.advance(task)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(check_fn, proxies))
+            results = list(executor.map(_run, proxies))
 
     alive = [p for p in results if p.alive]
     return sorted(alive, key=lambda p: p.latency_ms)
