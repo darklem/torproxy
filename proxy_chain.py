@@ -129,6 +129,79 @@ def _relay(sock_a: socket.socket, sock_b: socket.socket, timeout: int = 60):
         pass
 
 
+# ── HTTP CONNECT proxy handler (thread) ──────────────────────────────────────
+
+class _HttpConnectHandler(threading.Thread):
+    """
+    Handles a single HTTP CONNECT tunneling request.
+    The client sends:  CONNECT host:port HTTP/1.1\\r\\n...\\r\\n\\r\\n
+    We connect via the Tor→exit-proxy chain and reply 200, then relay.
+    """
+
+    def __init__(
+        self,
+        client_sock: socket.socket,
+        tor_port: int,
+        exit_proxy: "Proxy",
+        on_chain_failure: Optional[Callable] = None,
+    ):
+        super().__init__(daemon=True)
+        self.client_sock = client_sock
+        self.tor_port = tor_port
+        self.exit_proxy = exit_proxy
+        self.on_chain_failure = on_chain_failure
+
+    def run(self):
+        remote_sock = None
+        try:
+            # Read until end of HTTP headers
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = self.client_sock.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+
+            first_line = data.split(b"\r\n")[0].decode("utf-8", errors="replace")
+            parts = first_line.split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                self.client_sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+
+            host_port = parts[1]
+            host, _, port_str = host_port.rpartition(":")
+            try:
+                port = int(port_str)
+            except ValueError:
+                self.client_sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+
+            logger.info(f"HTTP CONNECT {host}:{port} via {self.exit_proxy.address}")
+
+            # Reuse _ClientHandler's chain-connect logic
+            dummy = _ClientHandler(self.client_sock, self.tor_port, self.exit_proxy)
+            remote_sock = dummy._connect_chain(host, port)
+
+            if remote_sock is None:
+                self.client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                if self.on_chain_failure:
+                    self.on_chain_failure()
+                return
+
+            self.client_sock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            _relay(self.client_sock, remote_sock)
+
+        except Exception as e:
+            logger.debug(f"HttpConnectHandler error: {e}")
+        finally:
+            for s in (self.client_sock, remote_sock):
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+
 # ── Per-connection handler (thread) ──────────────────────────────────────────
 
 class _ClientHandler(threading.Thread):
@@ -487,6 +560,7 @@ class ProxyChainServer:
         fail_threshold: int = 3,
         trigger_hosts: Optional[Set[str]] = None,
         status_port: Optional[int] = None,
+        http_port: Optional[int] = None,
     ):
         self.exit_proxy = exit_proxy
         self.tor_port = tor_port
@@ -494,6 +568,7 @@ class ProxyChainServer:
         self.local_host = local_host
         self._trigger_hosts = trigger_hosts
         self._status_port = status_port
+        self._http_port = http_port
 
         # Proxy pool for auto-rotation
         self._proxy_pool: List[Proxy] = proxy_pool if proxy_pool else [exit_proxy]
@@ -529,8 +604,10 @@ class ProxyChainServer:
         self._mitm_events_lock = threading.Lock()
 
         self._server_sock: Optional[socket.socket] = None
+        self._http_sock: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._http_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
         self._status_thread: Optional[threading.Thread] = None
 
@@ -546,6 +623,17 @@ class ProxyChainServer:
             self._thread.start()
             self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
             self._watchdog_thread.start()
+            if self._http_port:
+                self._http_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._http_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._http_sock.bind((self.local_host, self._http_port))
+                self._http_sock.listen(50)
+                self._http_thread = threading.Thread(target=self._http_accept_loop, daemon=True)
+                self._http_thread.start()
+                console.print(
+                    f"[green]HTTP CONNECT proxy ready: "
+                    f"[bold]http://{self.local_host}:{self._http_port}[/bold][/green]"
+                )
             if self._status_port:
                 self._status_thread = threading.Thread(
                     target=self._status_server_loop, daemon=True
@@ -569,6 +657,26 @@ class ProxyChainServer:
         except Exception as e:
             console.print(f"[red]Failed to start local server: {e}[/red]")
             return False
+
+    def _http_accept_loop(self):
+        self._http_sock.settimeout(1.0)
+        while self._running:
+            try:
+                client_sock, _ = self._http_sock.accept()
+                with self._lock:
+                    self._connections_accepted += 1
+                _HttpConnectHandler(
+                    client_sock=client_sock,
+                    tor_port=self.tor_port,
+                    exit_proxy=self.exit_proxy,
+                    on_chain_failure=self._on_chain_failure,
+                ).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self._running:
+                    logger.debug(f"HTTP accept error: {e}")
+                break
 
     def _accept_loop(self):
         self._server_sock.settimeout(1.0)
@@ -938,15 +1046,15 @@ class ProxyChainServer:
     def stop(self):
         logger.info("Server stopping")
         self._running = False
-        if self._server_sock:
-            try:
-                self._server_sock.close()
-            except Exception:
-                pass
-        if self._thread:
-            self._thread.join(timeout=3)
-        if self._watchdog_thread:
-            self._watchdog_thread.join(timeout=3)
+        for sock in (self._server_sock, self._http_sock):
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        for t in (self._thread, self._http_thread, self._watchdog_thread):
+            if t:
+                t.join(timeout=3)
 
     def __enter__(self):
         self.start()

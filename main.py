@@ -423,8 +423,8 @@ def run(
     _n_mitm_dirty = 0
 
     if not skip_verify:
-        console.print("[cyan]Verifying proxies through full chain (Tor → proxy → ipconfig.io)...[/cyan]")
-        tested_batch = candidates[:200]
+        console.print(f"[cyan]Verifying {len(candidates)} proxies through full chain (Tor → proxy → ipconfig.io)...[/cyan]")
+        tested_batch = candidates
         all_alive = check_proxies(
             tested_batch,
             via_tor_port=active_tor_port,
@@ -502,6 +502,7 @@ def run(
         fail_threshold=fail_threshold,
         trigger_hosts=DEFAULT_TRIGGER_HOSTS | extra_hosts,
         status_port=status_port,
+        http_port=local_port + 2,  # HTTP CONNECT proxy for mitmproxy upstream
     )
     if not server.start():
         tor.stop()
@@ -574,7 +575,7 @@ def run(
                 console.print("[yellow]Rescrape: no proxies match the selected country.[/yellow]")
                 return
             # Verify
-            batch = cands[:200]
+            batch = cands
             all_alive_new = check_proxies(batch, via_tor_port=active_tor_port, max_workers=20)
             mc = [p for p in all_alive_new if p.mitm_clean]
             md = [p for p in all_alive_new if not p.mitm_clean]
