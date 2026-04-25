@@ -423,8 +423,14 @@ def run(
     _n_mitm_dirty = 0
 
     if not skip_verify:
-        console.print(f"[cyan]Verifying {len(candidates)} proxies through full chain (Tor → proxy → ipconfig.io)...[/cyan]")
-        tested_batch = candidates
+        # When a country is selected the list is already narrow — test all.
+        # Without a country filter the list can be thousands; cap to avoid
+        # blocking startup for too long (20 workers × timeout ≈ manageable).
+        max_test = None if selected_country else 500
+        tested_batch = candidates if max_test is None else candidates[:max_test]
+        if max_test and len(candidates) > max_test:
+            console.print(f"[dim]  No country filter — capping test to {max_test} of {len(candidates)} proxies.[/dim]")
+        console.print(f"[cyan]Verifying {len(tested_batch)} proxies through full chain (Tor → proxy → ipconfig.io)...[/cyan]")
         all_alive = check_proxies(
             tested_batch,
             via_tor_port=active_tor_port,
@@ -574,8 +580,9 @@ def run(
             if not cands:
                 console.print("[yellow]Rescrape: no proxies match the selected country.[/yellow]")
                 return
-            # Verify
-            batch = cands
+            # Verify — cap only when no country filter is active
+            max_test = None if selected_country else 500
+            batch = cands if max_test is None else cands[:max_test]
             all_alive_new = check_proxies(batch, via_tor_port=active_tor_port, max_workers=20)
             mc = [p for p in all_alive_new if p.mitm_clean]
             md = [p for p in all_alive_new if not p.mitm_clean]
