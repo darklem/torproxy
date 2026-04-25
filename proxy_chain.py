@@ -374,9 +374,9 @@ tr:hover td{background:#1c2128}
 <nav class="nav"><a href="/" class="nav-link nav-active">Dashboard</a><a href="/database" class="nav-link">Database</a></nav>
 <div id="status-card" class="card"></div>
 <div id="mitm-card" class="card"></div>
-<div id="mitm-events-card" class="card">
+<div class="card">
   <h2>MITM Proxy Events <a href="/ca" download="mitmproxy-ca.cer" class="btn btn-ghost" style="float:right;text-decoration:none;font-size:.75rem;padding:4px 12px">⬇ Download CA (.cer)</a></h2>
-  <div class="dim" style="font-size:.82rem">No events yet.</div>
+  <div id="mitm-events-body"><div class="dim" style="font-size:.82rem">No events yet.</div></div>
 </div>
 <div class="card">
   <h2>Proxy Pool</h2>
@@ -391,15 +391,15 @@ function fmtTime(iso){return iso?new Date(iso).toLocaleTimeString():'—'}
 async function refreshMitmEvents(){
   try{
     const evts=await fetch('/mitm/events').then(r=>r.json());
-    const card=document.getElementById('mitm-events-card');
-    if(!evts||evts.length===0){card.innerHTML='<h2>MITM Proxy Events</h2><div class="dim" style="font-size:.82rem">No events yet.</div>';return;}
+    const body=document.getElementById('mitm-events-body');
+    if(!evts||evts.length===0){body.innerHTML='<div class="dim" style="font-size:.82rem">No events yet.</div>';return;}
     const recent=evts.slice(-20).reverse();
     const rows=recent.map(e=>{
       const t=new Date(e.ts*1000).toLocaleTimeString();
       const acol=e.action==='rotate'?'yellow':e.action==='block'?'red':'dim';
       return `<tr><td class="dim">${t}</td><td class="blue">${e.host}</td><td>${e.reason}</td><td class="${acol}">${e.action}</td></tr>`;
     }).join('');
-    card.innerHTML=`<h2>MITM Proxy Events <span class="dim" style="font-size:.7rem;font-weight:normal">(last 20)</span></h2><table><thead><tr><th>Time</th><th>Host</th><th>Reason</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>`;
+    body.innerHTML=`<table><thead><tr><th>Time</th><th>Host</th><th>Reason</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>`;
   }catch(e){}
 }
 async function refresh(){

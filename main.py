@@ -407,9 +407,14 @@ def run(
         border_style="cyan", padding=(0, 1),
     ))
 
+    no_geo = [p for p in proxies_with_geo if not p.country]
     if selected_country:
-        candidates = filter_by_country(proxies_with_geo, selected_country)
-        console.print(f"[cyan]{len(candidates)} proxies found for {flag(selected_country)} {selected_country}[/cyan]")
+        geo_candidates = filter_by_country(proxies_with_geo, selected_country)
+        candidates = geo_candidates + no_geo
+        console.print(
+            f"[cyan]{len(geo_candidates)} proxies for {flag(selected_country)} {selected_country}"
+            f" + {len(no_geo)} ungeolocated (will be tested and filtered)[/cyan]"
+        )
     else:
         candidates = proxies_with_geo
 
@@ -458,6 +463,12 @@ def run(
             console.print(
                 f"[yellow]  {len(mitm_dirty)} MITM-dirty proxies stored but excluded from pool.[/yellow]"
             )
+
+        # Filter by country after chain test (ipconfig.io fills country for previously-ungeo proxies)
+        if selected_country:
+            mitm_clean = [p for p in mitm_clean if p.country == selected_country]
+            mitm_dirty = [p for p in mitm_dirty if p.country == selected_country]
+            all_alive  = [p for p in all_alive  if p.country == selected_country]
 
         # Only present MITM-clean proxies to the chain
         if mitm_clean:
@@ -566,9 +577,10 @@ def run(
                     p.alive = True
                 if newly:
                     save_proxies_to_cache(newly)
-            # Filter by country
+            # Include ungeolocated proxies; chain test fills country via ipconfig.io
+            no_geo_new = [p for p in new_raw if not p.country]
             if selected_country:
-                cands = filter_by_country(new_raw, selected_country)
+                cands = filter_by_country(new_raw, selected_country) + no_geo_new
             else:
                 cands = new_raw
             if not cands:
@@ -576,6 +588,8 @@ def run(
                 return
             batch = cands
             all_alive_new = check_proxies(batch, via_tor_port=active_tor_port, max_workers=20)
+            if selected_country:
+                all_alive_new = [p for p in all_alive_new if p.country == selected_country]
             mc = [p for p in all_alive_new if p.mitm_clean]
             md = [p for p in all_alive_new if not p.mitm_clean]
             alive_keys = {(p.host, p.port) for p in all_alive_new}
