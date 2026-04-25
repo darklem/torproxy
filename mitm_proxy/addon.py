@@ -6,10 +6,12 @@ When a check fires, it optionally calls the TorProxy /rotate endpoint.
 All events are also pushed to /mitm/event for the admin dashboard.
 """
 
+import json
 import time
 import logging
+import urllib.request
+import urllib.error
 
-import requests
 import yaml
 
 from checks.rate_limit import RateLimitCheck
@@ -58,12 +60,20 @@ class TorProxyAddon:
         }
         if action == "rotate":
             try:
-                requests.post(f"{self.api}/rotate", timeout=5)
+                req = urllib.request.Request(f"{self.api}/rotate", data=b"", method="POST")
+                urllib.request.urlopen(req, timeout=5)
                 log.info(f"Rotated exit proxy (triggered by {host}: {reason})")
             except Exception as e:
                 log.warning(f"Could not reach TorProxy API to rotate: {e}")
         try:
-            requests.post(f"{self.api}/mitm/event", json=event, timeout=2)
+            body = json.dumps(event).encode()
+            req = urllib.request.Request(
+                f"{self.api}/mitm/event",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2)
         except Exception:
             pass
 
