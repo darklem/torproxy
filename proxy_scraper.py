@@ -29,8 +29,7 @@ from proxy_sources import SOURCES
 console = Console()
 logger = logging.getLogger(__name__)
 
-PROXY_CHECK_TIMEOUT = 8
-_CHAIN_VERIFY_TIMEOUT = 20   # seconds — longer because Tor + proxy + HTTPS
+_CHAIN_VERIFY_TIMEOUT = 20   # Tor + proxy + HTTPS round-trip can be slow
 MAX_CHECK_WORKERS = 30
 
 _IPCONFIG_HOST = "ipconfig.io"
@@ -459,77 +458,32 @@ def _verify_via_chain(proxy: Proxy, tor_port: int) -> Proxy:
     return proxy
 
 
-# ── Proxy liveness check ──────────────────────────────────────────────────────
-
-def _check_proxy(proxy: Proxy, via_tor_port: Optional[int] = None) -> Proxy:
-    """
-    Test whether a proxy is reachable.
-    If via_tor_port is set, the TCP connection goes through Tor first.
-    """
-    start = time.monotonic()
-    try:
-        if via_tor_port:
-            import socks as socks_mod
-            s = socks_mod.socksocket()
-            s.set_proxy(socks_mod.SOCKS5, "127.0.0.1", via_tor_port)
-            s.settimeout(PROXY_CHECK_TIMEOUT)
-            s.connect((proxy.host, proxy.port))
-            s.close()
-        else:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(PROXY_CHECK_TIMEOUT)
-            s.connect((proxy.host, proxy.port))
-            s.close()
-
-        proxy.latency_ms = (time.monotonic() - start) * 1000
-        proxy.alive = True
-    except Exception:
-        proxy.alive = False
-
-    return proxy
-
-
 def check_proxies(
     proxies: List[Proxy],
-    via_tor_port: Optional[int] = None,
+    via_tor_port: int,
     max_workers: int = MAX_CHECK_WORKERS,
-    show_progress: bool = True,
 ) -> List[Proxy]:
     """
-    Check all proxies in parallel and return the alive ones sorted by latency.
-
-    When via_tor_port is set, performs full chain verification:
-    Tor → exit proxy → ipconfig.io:443 (HTTPS).  This sets country/country_name
-    from the real exit IP and mitm_clean from TLS cert comparison.
+    Verify all proxies through the full chain (Tor → proxy → ipconfig.io:443).
+    Returns alive, MITM-checked proxies sorted by latency (fastest first).
     """
-    if via_tor_port:
-        # Pre-fetch the direct baseline once before spawning workers
-        _get_ipconfig_baseline()
-        check_fn = lambda p: _verify_via_chain(p, via_tor_port)
-        desc = f"[cyan]Verifying {len(proxies)} proxies via full chain (ipconfig.io)...[/cyan]"
-    else:
-        check_fn = lambda p: _check_proxy(p)
-        desc = f"[cyan]Checking {len(proxies)} proxies...[/cyan]"
-
+    _get_ipconfig_baseline()
+    desc = f"[cyan]Verifying {len(proxies)} proxies via full chain (ipconfig.io)...[/cyan]"
     results = []
 
-    if show_progress:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(desc, total=len(proxies))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(check_fn, p): p for p in proxies}
-                for future in concurrent.futures.as_completed(futures):
-                    results.append(future.result())
-                    progress.advance(task)
-    else:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(desc, total=len(proxies))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(check_fn, proxies))
+            futures = {executor.submit(_verify_via_chain, p, via_tor_port): p for p in proxies}
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+                progress.advance(task)
 
     alive = [p for p in results if p.alive]
     return sorted(alive, key=lambda p: p.latency_ms)

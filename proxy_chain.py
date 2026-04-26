@@ -705,7 +705,6 @@ class ProxyChainServer:
             failed = self._connections_failed
             last_rot = self._last_rotation_time
             last_reason = self._last_rotation_reason
-        with self._lock:
             mitm_verdict = self._mitm_verdict
             mitm_last = self._mitm_last_check
             mitm_checks = list(self._mitm_checks)
@@ -913,13 +912,6 @@ class ProxyChainServer:
             self._thread.join(timeout=3)
         if self._watchdog_thread:
             self._watchdog_thread.join(timeout=3)
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, *args):
-        self.stop()
 
 
 # ── Final IP check ────────────────────────────────────────────────────────────

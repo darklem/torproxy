@@ -54,20 +54,25 @@ def is_tor_installed() -> bool:
     return result.returncode == 0
 
 
+def _get_hashed_password() -> str:
+    """Run `tor --hash-password` and return the hashed control password."""
+    try:
+        result = subprocess.run(
+            ["tor", "--hash-password", TOR_CONTROL_PASSWORD],
+            capture_output=True, text=True,
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("16:"):
+                return line.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _get_tor_config() -> str:
     """Generate a minimal torrc configuration."""
     os.makedirs(TOR_DATA_DIR, exist_ok=True)
-    hash_result = subprocess.run(
-        ["tor", "--hash-password", TOR_CONTROL_PASSWORD],
-        capture_output=True, text=True,
-    )
-    hashed_pw = ""
-    if hash_result.returncode == 0:
-        for line in hash_result.stdout.strip().split("\n"):
-            if line.startswith("16:"):
-                hashed_pw = line.strip()
-                break
-
+    hashed_pw = _get_hashed_password()
     config = (
         f"SocksPort {TOR_SOCKS_PORT}\n"
         f"ControlPort {TOR_CONTROL_PORT}\n"
@@ -153,7 +158,7 @@ class TorManager:
                         "SocksPort": str(TOR_SOCKS_PORT),
                         "ControlPort": str(TOR_CONTROL_PORT),
                         "DataDirectory": TOR_DATA_DIR,
-                        "HashedControlPassword": self._get_hashed_password(),
+                        "HashedControlPassword": _get_hashed_password(),
                     },
                     completion_percent=100,
                     init_msg_handler=lambda line: None,
@@ -215,19 +220,6 @@ class TorManager:
             console.print(f"[red]Tor startup error: {e}[/red]")
             return False
 
-    def _get_hashed_password(self) -> str:
-        try:
-            result = subprocess.run(
-                ["tor", "--hash-password", TOR_CONTROL_PASSWORD],
-                capture_output=True, text=True,
-            )
-            for line in result.stdout.strip().split("\n"):
-                if line.startswith("16:"):
-                    return line.strip()
-        except Exception:
-            pass
-        return ""
-
     def _connect_controller(self) -> bool:
         if not STEM_AVAILABLE:
             return True
@@ -263,20 +255,6 @@ class TorManager:
                 console.print(f"[yellow]Could not rotate circuit: {e}[/yellow]")
         return False
 
-    def get_exit_ip(self) -> Optional[str]:
-        """Return the current Tor exit IP."""
-        import requests
-        proxies = {
-            "http": f"socks5h://127.0.0.1:{self._socks_port}",
-            "https": f"socks5h://127.0.0.1:{self._socks_port}",
-        }
-        for url in ("https://api.ipify.org", "http://checkip.amazonaws.com"):
-            try:
-                return requests.get(url, proxies=proxies, timeout=15).text.strip()
-            except Exception:
-                continue
-        return None
-
     def stop(self):
         """Stop Tor if we started it ourselves."""
         if self.controller:
@@ -295,8 +273,3 @@ class TorManager:
                 except Exception:
                     pass
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.stop()
